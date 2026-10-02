@@ -2,4 +2,11 @@
 .uv-cache/
 __pycache__/
 *.pyc
-ppt_slides/ppt_log.txt
+# 运行生成的课件、图片和个人设置
+ppt_slides/
+app_settings.json
+
+回收站/
+tools/Tesseract-OCR/
+.claude/settings.local.json
+_replace_find_week_tab.py

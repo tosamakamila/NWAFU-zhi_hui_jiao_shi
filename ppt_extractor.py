@@ -1,6 +1,6 @@
 """
-智慧课堂PPT扒取器 v6.0
-多组点击序列 + 分组排队循环 + 可配延迟
+课件捕获助手 v8.0
+自动认课、翻页检测、智能识别路由与 PDF 导出
 """
 
 # ---- DPI 感知：必须在任何 GUI 库之前执行 ----
@@ -17,30 +17,172 @@ import pyautogui
 import cv2
 import numpy as np
 import os
+import shutil
 import time
 import sys
 import json
 import threading
+from concurrent.futures import ThreadPoolExecutor
 import tkinter as tk
 import re
 from datetime import datetime
+from tkinter import filedialog, ttk
 from pynput import keyboard, mouse
 from ctypes import wintypes
 from PIL import ImageGrab, Image
+
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# OCR runs in child Tesseract processes. Without this limit OpenMP may occupy
+# every CPU core for each newly captured slide and make the desktop feel stuck.
+os.environ["OMP_THREAD_LIMIT"] = "1"
+try:
+    cv2.setNumThreads(1)
+except Exception:
+    pass
+
+from smart_course import (
+    TinyVisionRouter,
+    build_speed_plan,
+    interpolate_sequence_position,
+    parse_course_stamp,
+    rank_course_cards,
+)
 
 try:
     import pytesseract
 except Exception:
     pytesseract = None
 
-TESSERACT_CMD = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
-TESSDATA_DIR = r"C:\Program Files\Tesseract-OCR\tessdata"
-if pytesseract is not None and os.path.exists(TESSERACT_CMD):
-    pytesseract.pytesseract.tesseract_cmd = TESSERACT_CMD
+try:
+    import uiautomation as windows_uia
+except Exception:
+    windows_uia = None
+
+try:
+    from windows_capture import WindowsCapture
+except Exception:
+    WindowsCapture = None
+
+def _candidate_project_files(filename):
+    """Search project-owned tool/data folders without traversing captures or environments."""
+    skip_dirs = {
+        ".git", ".venv", "venv", ".uv-cache", "__pycache__", "ppt_slides",
+        ".codex", ".claude", "tests", "node_modules",
+    }
+    for root in (APP_DIR, os.path.join(APP_DIR, "tools"), os.path.join(APP_DIR, "vendor")):
+        if not os.path.isdir(root):
+            continue
+        for current, directories, files in os.walk(root):
+            directories[:] = [name for name in directories if name.lower() not in skip_dirs]
+            if filename.lower() in {name.lower() for name in files}:
+                yield os.path.join(current, filename)
+
+
+def _find_tesseract():
+    candidates = []
+    configured = os.environ.get("TESSERACT_CMD", "").strip().strip('"')
+    if configured:
+        candidates.append(configured)
+    on_path = shutil.which("tesseract") or shutil.which("tesseract.exe")
+    if on_path:
+        candidates.append(on_path)
+
+    for base in (
+        APP_DIR,
+        os.path.dirname(APP_DIR),
+        os.path.join(APP_DIR, "tools"),
+        os.path.join(os.environ.get("ProgramFiles", ""), "Tesseract-OCR"),
+        os.path.join(os.environ.get("ProgramFiles(x86)", ""), "Tesseract-OCR"),
+        os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs", "Tesseract-OCR"),
+    ):
+        if base:
+            candidates.extend((
+                os.path.join(base, "tesseract.exe"),
+                os.path.join(base, "Tesseract-OCR", "tesseract.exe"),
+            ))
+    candidates.extend(_candidate_project_files("tesseract.exe"))
+    for candidate in dict.fromkeys(candidates):
+        if os.path.isfile(candidate):
+            return os.path.abspath(candidate)
+    return None
+
+
+def _find_tessdata_dir(tesseract_path=None):
+    candidates = []
+    configured = os.environ.get("TESSDATA_PREFIX", "").strip().strip('"')
+    if configured:
+        candidates.extend((configured, os.path.join(configured, "tessdata")))
+    if tesseract_path:
+        binary_dir = os.path.dirname(tesseract_path)
+        candidates.extend((
+            os.path.join(binary_dir, "tessdata"),
+            os.path.join(binary_dir, "..", "share", "tessdata"),
+            os.path.join(binary_dir, "..", "..", "share", "tessdata"),
+        ))
+    candidates.extend((
+        os.path.join(APP_DIR, "tessdata"),
+        os.path.join(APP_DIR, "tools", "Tesseract-OCR", "tessdata"),
+        os.path.join(APP_DIR, "tools", "Tesseract-OCR", "share", "tessdata"),
+        os.path.join(APP_DIR, "tools", "tessdata"),
+    ))
+    fallback = None
+    for candidate in candidates:
+        resolved = os.path.abspath(candidate)
+        if not os.path.isdir(resolved):
+            continue
+        data_files = {name.lower() for name in os.listdir(resolved)}
+        if "chi_sim.traineddata" in data_files:
+            return resolved
+        if fallback is None and any(name.endswith(".traineddata") for name in data_files):
+            fallback = resolved
+    return fallback
+
+
+TESSERACT_CMD = _find_tesseract()
+TESSDATA_DIR = _find_tessdata_dir(TESSERACT_CMD)
+if pytesseract is not None:
+    if TESSERACT_CMD:
+        pytesseract.pytesseract.tesseract_cmd = TESSERACT_CMD
+    if TESSDATA_DIR:
+        os.environ["TESSDATA_PREFIX"] = TESSDATA_DIR
 
 # ---- Windows API 窗口捕获 ----
 _user32 = ctypes.windll.user32
 _gdi32 = ctypes.windll.gdi32
+_user32.WindowFromPoint.argtypes = [wintypes.POINT]
+_user32.WindowFromPoint.restype = wintypes.HWND
+_user32.ChildWindowFromPointEx.argtypes = [wintypes.HWND, wintypes.POINT, wintypes.UINT]
+_user32.ChildWindowFromPointEx.restype = wintypes.HWND
+_user32.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
+_user32.GetAncestor.restype = wintypes.HWND
+_user32.ScreenToClient.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.POINT)]
+_user32.ScreenToClient.restype = wintypes.BOOL
+_user32.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+_user32.PostMessageW.restype = wintypes.BOOL
+_user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+_user32.GetWindowRect.restype = wintypes.BOOL
+_user32.GetWindowDC.argtypes = [wintypes.HWND]
+_user32.GetWindowDC.restype = wintypes.HDC
+_user32.ReleaseDC.argtypes = [wintypes.HWND, wintypes.HDC]
+_user32.ReleaseDC.restype = ctypes.c_int
+_user32.PrintWindow.argtypes = [wintypes.HWND, wintypes.HDC, wintypes.UINT]
+_user32.PrintWindow.restype = wintypes.BOOL
+_gdi32.CreateCompatibleDC.argtypes = [wintypes.HDC]
+_gdi32.CreateCompatibleDC.restype = wintypes.HDC
+_gdi32.CreateCompatibleBitmap.argtypes = [wintypes.HDC, ctypes.c_int, ctypes.c_int]
+_gdi32.CreateCompatibleBitmap.restype = wintypes.HBITMAP
+_gdi32.SelectObject.argtypes = [wintypes.HDC, wintypes.HGDIOBJ]
+_gdi32.SelectObject.restype = wintypes.HGDIOBJ
+_gdi32.GetDIBits.argtypes = [
+    wintypes.HDC, wintypes.HBITMAP, wintypes.UINT, wintypes.UINT,
+    ctypes.c_void_p, ctypes.c_void_p, wintypes.UINT,
+]
+_gdi32.GetDIBits.restype = ctypes.c_int
+_gdi32.DeleteObject.argtypes = [wintypes.HGDIOBJ]
+_gdi32.DeleteObject.restype = wintypes.BOOL
+_gdi32.DeleteDC.argtypes = [wintypes.HDC]
+_gdi32.DeleteDC.restype = wintypes.BOOL
 
 class _BITMAPINFOHEADER(ctypes.Structure):
     _fields_ = [
@@ -50,6 +192,100 @@ class _BITMAPINFOHEADER(ctypes.Structure):
         ('biXPelsPerMeter', wintypes.LONG), ('biYPelsPerMeter', wintypes.LONG),
         ('biClrUsed', wintypes.DWORD), ('biClrImportant', wintypes.DWORD),
     ]
+
+class _GraphicsCaptureBackend:
+    """缓存 Windows Graphics Capture 帧，可捕获被其他窗口遮挡的窗口。"""
+    def __init__(self):
+        self._guard = threading.Lock()
+        self._hwnd = None
+        self._latest = None
+        self._control = None
+        self._capture = None
+        self._failed_hwnds = set()
+        self._reported_empty_hwnds = set()
+
+    def stop(self):
+        with self._guard:
+            control = self._control
+            self._control = None
+            self._capture = None
+            self._hwnd = None
+            self._latest = None
+        if control:
+            try:
+                control.stop()
+            except Exception:
+                pass
+
+    def _start(self, hwnd):
+        self.stop()
+        if WindowsCapture is None or hwnd in self._failed_hwnds:
+            return False
+        try:
+            capture = WindowsCapture(
+                cursor_capture=False,
+                draw_border=None,
+                minimum_update_interval=400,
+                window_hwnd=int(hwnd),
+            )
+
+            @capture.event
+            def on_frame_arrived(frame, _capture_control):
+                image = frame.frame_buffer
+                if image is not None and image.size:
+                    with self._guard:
+                        if self._hwnd == hwnd:
+                            self._latest = image[:, :, :3].copy()
+
+            @capture.event
+            def on_closed():
+                with self._guard:
+                    if self._hwnd == hwnd:
+                        self._control = None
+
+            # 有的窗口只在画面变化时送帧。必须先登记句柄再启动捕获，
+            # 否则启动瞬间的首帧会被回调丢掉，静态 PPT 随后一直走兼容截图。
+            with self._guard:
+                self._hwnd = hwnd
+                self._capture = capture
+                self._latest = None
+            control = capture.start_free_threaded()
+            with self._guard:
+                self._control = control
+            return True
+        except Exception as exc:
+            self.stop()
+            self._failed_hwnds.add(hwnd)
+            log(f"后台独立窗口捕获不可用，将尝试兼容截图: {exc}")
+            return False
+
+    def grab(self, hwnd, wait_seconds=0.7):
+        # 最小化的窗口不会被 DWM 合成，WGC 与 PrintWindow 都只能拿到最后一帧。
+        # 若继续返回该帧，监测循环会误以为“画面不变”，因此明确返回 None。
+        try:
+            if _user32.IsIconic(hwnd):
+                return None
+        except Exception:
+            pass
+        with self._guard:
+            needs_start = self._hwnd != hwnd or self._control is None
+        if needs_start and not self._start(hwnd):
+            return None
+        deadline = time.time() + wait_seconds
+        while time.time() < deadline:
+            with self._guard:
+                frame = self._latest
+            if frame is not None:
+                # on_frame_arrived stores a fresh array and never mutates it;
+                # returning the cached frame avoids a full-window copy per poll.
+                return frame
+            time.sleep(0.02)
+        if hwnd not in self._reported_empty_hwnds:
+            self._reported_empty_hwnds.add(hwnd)
+            log("后台独立窗口捕获尚未收到画面；兼容截图可能在遮挡时变黑")
+        return None
+
+_graphics_capture = _GraphicsCaptureBackend()
 
 def _capture_to_array(memDC, hBmp, w, h):
     """从内存DC中读取位图数据为BGR numpy数组"""
@@ -66,7 +302,16 @@ def _capture_to_array(memDC, hBmp, w, h):
     return img[:, :, :3].copy()  # BGR
 
 def capture_window(hwnd):
-    """PrintWindow 捕获窗口内容（可后台截图）。黑屏则快速重试，仍黑屏返回 None。"""
+    """优先 WGC 后台捕获；失败时回退 PrintWindow。"""
+    # 最小化的窗口拿不到真实画面，PrintWindow 只会返回小尺寸残图，
+    # 直接返回 None，让监测循环明确提示而不是静默使用错误帧。
+    if _user32.IsIconic(hwnd):
+        return None
+    graphics_frame = _graphics_capture.grab(hwnd)
+    if graphics_frame is not None and not _is_black_frame(graphics_frame):
+        return graphics_frame
+
+    # PrintWindow 兼容兜底。
     rect = wintypes.RECT()
     _user32.GetWindowRect(hwnd, ctypes.byref(rect))
     w = rect.right - rect.left
@@ -86,12 +331,12 @@ def capture_window(hwnd):
         for i in range(3):
             _user32.PrintWindow(hwnd, memDC, 2)
             img = _capture_to_array(memDC, hBmp, w, h)
-            if np.mean(img) >= 5:
+            if not _is_black_frame(img):
                 return img
             # 黑屏再试一次 flag=0
             _user32.PrintWindow(hwnd, memDC, 0)
             img = _capture_to_array(memDC, hBmp, w, h)
-            if np.mean(img) >= 5:
+            if not _is_black_frame(img):
                 return img
             time.sleep(0.03)
         return None
@@ -147,7 +392,15 @@ def _sanitize_name(name):
 def _is_black_frame(img):
     if img is None or img.size == 0:
         return True
-    return float(np.mean(img)) < BLACK_MEAN_THRESHOLD and float(np.std(img)) < BLACK_STD_THRESHOLD
+    if float(np.mean(img)) < BLACK_MEAN_THRESHOLD and float(np.std(img)) < BLACK_STD_THRESHOLD:
+        return True
+    # 视频区域变黑时，水印、顶端色条仍会抬高整张图的均值/方差。
+    height, width = img.shape[:2]
+    center = img[int(height * .08):int(height * .92), int(width * .06):int(width * .94)]
+    if center.size == 0:
+        return False
+    gray = cv2.cvtColor(center, cv2.COLOR_BGR2GRAY) if center.ndim == 3 else center
+    return float(np.mean(gray)) < 12 and float(np.mean(gray < 20)) > .95
 
 def _infer_duration_from_name(name):
     """从组名里的 10-09-10-55 / 10:09-10:55 推断秒数"""
@@ -188,18 +441,30 @@ def _get_group_duration(group):
 def _export_session_pdf(out_dir, label=None):
     """把当前会话内的 slide_*.png 合成 PDF"""
     try:
-        slides = sorted(
-            os.path.join(out_dir, f)
-            for f in os.listdir(out_dir)
-            if f.lower().startswith("slide_") and f.lower().endswith(".png")
-        )
+        slides = []
+        for current_dir, _, files in os.walk(out_dir):
+            for filename in files:
+                if filename.lower().startswith("slide_") and filename.lower().endswith(".png"):
+                    slides.append(os.path.join(current_dir, filename))
+        slides.sort(key=lambda path: (
+            int(re.search(r"slide_(\d+)", os.path.basename(path), re.I).group(1))
+            if re.search(r"slide_(\d+)", os.path.basename(path), re.I)
+            else 10**9,
+            os.path.basename(path),
+        ))
         if not slides:
             return None
         base = _sanitize_name(label or os.path.basename(out_dir))
         pdf_path = os.path.join(out_dir, f"{base}.pdf")
         images = []
         for path in slides:
-            img = Image.open(path).convert("RGB")
+            source = Image.open(path)
+            if source.mode == "RGB":
+                # 保持惰性加载，避免一次性把上百张高清截图全部展开到内存。
+                img = source
+            else:
+                img = source.convert("RGB")
+                source.close()
             images.append(img)
         first, rest = images[0], images[1:]
         first.save(pdf_path, save_all=True, append_images=rest)
@@ -211,11 +476,28 @@ def _export_session_pdf(out_dir, label=None):
         log(f"PDF 导出失败: {e}")
         return None
 
-OUTPUT_DIR = r"D:\Work_Place\ppt-takeaway\ppt_slides"
+APP_SETTINGS_FILE = os.path.join(APP_DIR, "app_settings.json")
+DEFAULT_OUTPUT_DIR = os.path.join(APP_DIR, "ppt_slides")
+
+def _load_app_output_dir():
+    try:
+        with open(APP_SETTINGS_FILE, "r", encoding="utf-8") as f:
+            raw = str(json.load(f).get("output_dir", "")).strip()
+        if raw:
+            return os.path.abspath(os.path.expandvars(os.path.expanduser(raw)))
+    except Exception:
+        pass
+    return DEFAULT_OUTPUT_DIR
+
+OUTPUT_DIR = _load_app_output_dir()
 CHANGE_THRESHOLD = 8
-CHECK_INTERVAL = 0.3
+CHECK_INTERVAL = 0.9
 HASH_SIMILARITY = 0.95
 STABLE_FRAMES = 1
+# 监测期间画面长时间（秒）完全不变时给出告警：通常意味着播放暂停/缓冲，
+# 或窗口被最小化后 DWM 不再合成画面。
+FREEZE_WARN_SECONDS = 180
+SW_RESTORE = 9
 TEMPLATE_SIZE = 120  # 模板图片边长（像素）
 TEMPLATE_MATCH_THRESHOLD = 0.65  # 匹配置信度阈值
 CLICK_RETRY_GAP = 0.25
@@ -223,10 +505,15 @@ CLICK_SETTLE_DELAY = 0.15
 CLICK_HOLD_SECONDS = 0.06
 def _available_ocr_langs():
     langs = set()
-    if os.path.isdir(TESSDATA_DIR):
+    if TESSDATA_DIR and os.path.isdir(TESSDATA_DIR):
         for name in os.listdir(TESSDATA_DIR):
-            if name.endswith(".traineddata"):
+            if name.lower().endswith(".traineddata"):
                 langs.add(os.path.splitext(name)[0])
+    if not langs and pytesseract is not None and TESSERACT_CMD:
+        try:
+            langs.update(pytesseract.get_languages(config=""))
+        except Exception:
+            pass
     return langs
 
 def _preferred_ocr_lang():
@@ -245,9 +532,9 @@ SMART_CLICK_KEYWORDS_BY_STEP = [
     ["课表录制", "课堂回放", "回放", "录制"],
     ["进入回放", "回放", "播放"],
 ]
-OCR_SCALE = 2.0
+OCR_SCALE = 1.6
 OCR_MIN_CONFIDENCE = 25
-OCR_SCROLL_TRIES = 8
+OCR_SCROLL_TRIES = 3
 OCR_SCROLL_AMOUNT = -5
 DEFAULT_SIMPLE_WEEKS = "1-16"
 SIMPLE_LESSONS = (1, 2)
@@ -259,6 +546,30 @@ TEMPLATE_DIR = os.path.join(OUTPUT_DIR, "templates")
 BLACK_MEAN_THRESHOLD = 5
 BLACK_STD_THRESHOLD = 3
 MIN_VALID_CAPTURE_RETRIES = 3
+_vision_router = TinyVisionRouter()
+
+def _set_output_dir(path):
+    """切换截图输出目录，并把选择保存在项目级设置中。"""
+    global OUTPUT_DIR, GROUPS_FILE, CONFIG_FILE, OLD_CLICK_FILE, TEMPLATE_DIR
+    target = os.path.abspath(os.path.expandvars(os.path.expanduser(str(path or "").strip())))
+    if not target:
+        raise ValueError("输出目录不能为空")
+    os.makedirs(target, exist_ok=True)
+    probe = os.path.join(target, ".ppt_extractor_write_test")
+    with open(probe, "w", encoding="utf-8") as f:
+        f.write("ok")
+    os.remove(probe)
+    OUTPUT_DIR = target
+    GROUPS_FILE = os.path.join(target, "groups.json")
+    CONFIG_FILE = os.path.join(target, "config.json")
+    OLD_CLICK_FILE = os.path.join(target, "click_sequence.json")
+    TEMPLATE_DIR = os.path.join(target, "templates")
+    with open(APP_SETTINGS_FILE, "w", encoding="utf-8") as f:
+        json.dump({"output_dir": target}, f, ensure_ascii=False, indent=2)
+    if "_config" in globals():
+        _config["output_dir"] = target
+        save_config(_config)
+    return target
 
 def log(msg):
     os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -269,8 +580,24 @@ def log(msg):
     print(f"[{t}] {safe_msg}")
 
 def _save_debug_screenshot(label="debug"):
-    """保存当前锁定窗口截图到输出目录，用于排查定位问题。（已禁用）"""
-    pass
+    """保存当前锁定窗口截图到输出目录，用于排查定位问题。"""
+    try:
+        with _lock:
+            hwnd = state.get("target_hwnd")
+        if not hwnd or not is_window_visible(hwnd):
+            return None
+        image = capture_window(hwnd)
+        if image is None or _is_black_frame(image):
+            return None
+        debug_dir = os.path.join(OUTPUT_DIR, "_debug")
+        os.makedirs(debug_dir, exist_ok=True)
+        path = os.path.join(debug_dir, f"{_sanitize_name(label)}_{datetime.now():%H%M%S}.png")
+        if cv2_imwrite(path, image):
+            log(f"调试截图已保存: {path}")
+            return path
+    except Exception as e:
+        log(f"调试截图失败: {e}")
+    return None
 
 # ---- 数据格式 & 迁移 ----
 def load_groups():
@@ -323,7 +650,20 @@ def load_config():
                 return json.load(f)
         except Exception:
             pass
-    return {"interval_minutes": 30, "default_delay": 1.0, "global_group_loop": True, "simple_click_profile": []}
+    return {
+        "interval_minutes": 30,
+        "default_delay": 1.0,
+        "global_group_loop": True,
+        "simple_click_profile": [],
+        "interaction_mode": "foreground",
+        "cursor_free_opt_in": True,
+        "playback_speed": "auto",
+        "speed_tail_seconds": 90,
+        "ui_mode": "auto",
+        "simple_use_card_duration": True,
+        "output_dir": OUTPUT_DIR,
+        "heartbeat_log": False,
+    }
 
 def save_config(cfg):
     os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -331,6 +671,17 @@ def save_config(cfg):
         json.dump(cfg, f, ensure_ascii=False, indent=2)
 
 _config = load_config()
+_config.setdefault("interaction_mode", "foreground")
+_config.setdefault("playback_speed", "auto")
+_config.setdefault("speed_tail_seconds", 90)
+_config.setdefault("ui_mode", "auto")
+_config.setdefault("simple_use_card_duration", True)
+_config["output_dir"] = OUTPUT_DIR
+_cursor_free_enabled = bool(
+    _config.get("cursor_free_opt_in", _config.get("background_click_opt_in", True))
+)
+_config["cursor_free_opt_in"] = _cursor_free_enabled
+_config["interaction_mode"] = "uia" if _cursor_free_enabled else "foreground"
 
 state = {
     "running": True,
@@ -354,6 +705,12 @@ state = {
     "target_hwnd": None,    # 锁定的窗口句柄（None=屏幕截取模式）
     "window_picking": False, # 是否正在选取窗口
     "window_title": "",     # 锁定窗口的标题
+    "course_name": "",      # 微信小程序顶部课程名
+    "current_speed": 1.0,
+    "background_clicks": 0,
+    "foreground_clicks": 0,
+    "monitor_generation": 0,
+    "capture_paused": False,
 }
 _lock = threading.Lock()
 
@@ -372,8 +729,13 @@ class ChangeDetector:
         self._init_count = 0
 
     def detect(self, frame):
+        # 检测只需要低分辨率灰度图；保存时仍保留完整原图。
+        height, width = frame.shape[:2]
+        if width > 480:
+            scale = 480.0 / width
+            frame = cv2.resize(frame, (480, max(1, int(height * scale))), interpolation=cv2.INTER_AREA)
         g = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        g = cv2.GaussianBlur(g, (5, 5), 0)
+        g = cv2.GaussianBlur(g, (3, 3), 0)
 
         if self.ref is None:
             if self.prev is not None:
@@ -502,26 +864,41 @@ def manual_capture():
         log(f"截图失败: {e}")
 
 # ====================== 监测会话管理 ======================
-def _make_session_dir(label):
+def _make_session_dir(label, root_dir=None):
     """为监测会话创建独立子目录，优先使用组名/课程名"""
+    root_dir = root_dir or OUTPUT_DIR
     base = _sanitize_name(label)
     name = base
     idx = 2
-    while os.path.exists(os.path.join(OUTPUT_DIR, name)):
+    while os.path.exists(os.path.join(root_dir, name)):
         name = f"{base}_{idx:02d}"
         idx += 1
-    full = os.path.join(OUTPUT_DIR, name)
+    full = os.path.join(root_dir, name)
     os.makedirs(full, exist_ok=True)
     return full
 
 def _start_monitoring(region, label="手动"):
     """创建会话目录并启动监测"""
-    session_dir = _make_session_dir(label)
     with _lock:
+        course_name = state.get("course_name", "")
+    if not course_name:
+        course_name = _detect_course_name() or ""
+    course_root = OUTPUT_DIR
+    if course_name:
+        safe_course = _sanitize_name(course_name)
+        if os.path.normcase(os.path.basename(os.path.normpath(OUTPUT_DIR))) != os.path.normcase(safe_course):
+            course_root = os.path.join(OUTPUT_DIR, safe_course)
+        os.makedirs(course_root, exist_ok=True)
+        with _lock:
+            state["course_name"] = course_name
+    session_dir = _make_session_dir(label, course_root)
+    with _lock:
+        state["monitor_generation"] += 1
+        generation = state["monitor_generation"]
         state["session_dir"] = session_dir
         state["session_label"] = label
         state["monitoring"] = True
-    threading.Thread(target=monitoring_loop, args=(region,), daemon=True).start()
+    threading.Thread(target=monitoring_loop, args=(region, generation), daemon=True).start()
     log(f"监测会话开始 -> {os.path.basename(session_dir)}/")
 
 def _stop_monitoring():
@@ -529,6 +906,7 @@ def _stop_monitoring():
     with _lock:
         was = state["monitoring"]
         state["monitoring"] = False
+        state["monitor_generation"] += 1
     if was:
         time.sleep(CHECK_INTERVAL + 0.2)  # 等待监测循环退出
         log("监测会话结束")
@@ -566,6 +944,22 @@ def _grab_ocr_image(search_region=None):
     """返回 (PIL图像, offset_x, offset_y)。无指定区域时优先读取锁定窗口。"""
     if search_region:
         sx, sy, sw, sh = search_region
+        with _lock:
+            hwnd = state.get("target_hwnd")
+        if hwnd and is_window_visible(hwnd):
+            rect = wintypes.RECT()
+            _user32.GetWindowRect(hwnd, ctypes.byref(rect))
+            if rect.left <= sx and rect.top <= sy and sx + sw <= rect.right and sy + sh <= rect.bottom:
+                image = capture_window(hwnd)
+                if image is not None and not _is_black_frame(image):
+                    local_x = sx - rect.left
+                    local_y = sy - rect.top
+                    crop = image[local_y:local_y + sh, local_x:local_x + sw]
+                    if crop.size:
+                        rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+                        return Image.fromarray(rgb), sx, sy
+            # 锁定窗口无法后台截图时，不可退回桌面截图：桌面可能已被别的窗口遮住。
+            return Image.new("RGB", (sw, sh), "white"), sx, sy
         return ImageGrab.grab(bbox=(sx, sy, sx + sw, sy + sh)), sx, sy
 
     with _lock:
@@ -578,6 +972,9 @@ def _grab_ocr_image(search_region=None):
             rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
             return Image.fromarray(rgb), rect.left, rect.top
 
+        rect = wintypes.RECT()
+        _user32.GetWindowRect(hwnd, ctypes.byref(rect))
+        return Image.new("RGB", (max(1, rect.right - rect.left), max(1, rect.bottom - rect.top)), "white"), rect.left, rect.top
     return ImageGrab.grab(), 0, 0
 
 def _find_target(template_fname, search_region=None, threshold=TEMPLATE_MATCH_THRESHOLD):
@@ -670,10 +1067,10 @@ def _scan_completed_week_lessons():
     if not os.path.isdir(OUTPUT_DIR):
         return completed_lessons, completed_weeks
     try:
-        names = [
-            name for name in os.listdir(OUTPUT_DIR)
-            if os.path.isdir(os.path.join(OUTPUT_DIR, name)) or name.lower().endswith(".pdf")
-        ]
+        names = []
+        for _, directories, files in os.walk(OUTPUT_DIR):
+            names.extend(directories)
+            names.extend(name for name in files if name.lower().endswith(".pdf"))
     except Exception:
         return completed_lessons, completed_weeks
     for name in names:
@@ -682,10 +1079,11 @@ def _scan_completed_week_lessons():
             continue
         week = int(week_match.group(1))
         completed_weeks.add(week)
-        lesson_match = re.search(r"第?\s*([一二12])\s*(?:节|课)", name)
+        lesson_match = re.search(r"第?\s*([一二三四五六七八九十]|\d{1,2})\s*(?:节|课)", name)
         if lesson_match:
             token = lesson_match.group(1)
-            lesson = 1 if token in ("一", "1") else 2
+            chinese_lessons = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9, "十": 10}
+            lesson = chinese_lessons.get(token, int(token) if token.isdigit() else 0)
             completed_lessons.add((week, lesson))
     return completed_lessons, completed_weeks
 
@@ -728,12 +1126,16 @@ def _has_position_model(profile):
     return _build_position_model(profile) is not None
 
 def _lesson_words(lesson):
+    chinese = {1: "一", 2: "二", 3: "三", 4: "四", 5: "五", 6: "六"}.get(int(lesson), str(lesson))
+    words = [str(lesson), f"第{lesson}节", f"第{chinese}节", f"{lesson}节", f"{chinese}节"]
     if lesson == 1:
-        return ["1", "第1节", "第一节", "1节", "一节", "上节"]
-    return ["2", "第2节", "第二节", "2节", "二节", "下节"]
+        words.append("上节")
+    elif lesson == 2:
+        words.append("下节")
+    return words
 
 def _course_card_point(lesson):
-    """切换节次弹窗中，第1节通常是右侧 10:09 卡片，第2节通常是左侧 11:04 卡片。"""
+    """按时间排序选择第 N 张课程卡；旧双卡布局只作为兜底。"""
     region = _locked_window_region()
     if not region:
         return None
@@ -741,6 +1143,10 @@ def _course_card_point(lesson):
     if ocr_point:
         return ocr_point
     x, y, w, h = region
+    if int(lesson) > 2:
+        log(f"  未识别出第{lesson}张课表卡片，不使用危险的固定坐标兜底")
+        return None
+    # 兼容旧双卡布局：右边第1节，左边第2节。
     rel_x = 0.49 if int(lesson) == 1 else 0.18
     rel_y = 0.50
     point = (x + int(w * rel_x), y + int(h * rel_y))
@@ -748,20 +1154,198 @@ def _course_card_point(lesson):
     return point
 
 def _course_card_point_by_time(lesson):
-    """优先按卡片上的时间文字定位课表卡片。"""
-    region = _course_cards_region()
+    """识别全部可见时间，按开始时间排序后定位第 N 张卡片。"""
+    cards = _discover_course_cards()
+    if cards:
+        detail = ", ".join(f"{card['lesson']}={card['time']}" for card in cards)
+        log(f"  课表卡片按时间排序: {detail}")
+    index = int(lesson) - 1
+    if 0 <= index < len(cards):
+        card = cards[index]
+        log(f"  第{lesson}节 -> {card['time']} ({card['cx']},{card['cy']})")
+        return (card["cx"], card["cy"])
+    log(f"  只识别到{len(cards)}张卡片，找不到第{lesson}节，使用兼容兜底")
+    return None
+
+def _detect_course_name():
+    """读取微信小程序顶部紫色标题栏中的课程名称。"""
+    if pytesseract is None:
+        return None
+    region = _locked_window_region()
     if not region:
         return None
-    lesson = int(lesson)
-    target_digits = "1009" if lesson == 1 else "1104"
-    items = _ocr_items(region)
-    for item in items:
-        digits = re.sub(r"\D+", "", item["text"])
-        if target_digits in digits:
-            log(f"  课表卡片 OCR 定位: 第{lesson}节 命中 {item['raw']!r} -> ({item['cx']},{item['cy']})")
-            return (item["cx"], item["cy"])
-    log(f"  课表卡片 OCR 未命中第{lesson}节时间({target_digits})，使用固定兜底")
+    x, y, w, h = region
+    title_region = (
+        x + int(w * 0.35),
+        y + int(h * 0.04),
+        int(w * 0.30),
+        int(h * 0.05),
+    )
+    try:
+        pil_img, _, _ = _grab_ocr_image(title_region)
+        rgb = np.array(pil_img.convert("RGB"))
+        enlarged = cv2.resize(rgb, None, fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
+        raw = pytesseract.image_to_string(enlarged, lang="chi_sim", config="--psm 7")
+        name = re.sub(r"\s+", "", raw).strip("-—_丨|·.。")
+        name = _sanitize_name(name)
+        if (
+            2 <= len(name) <= 40
+            and len(re.findall(r"[\u4e00-\u9fff]", name)) >= 2
+            and name not in ("智慧教室", "课件捕获助手")
+        ):
+            log(f"识别课程名称: {name}")
+            return name
+    except Exception as e:
+        log(f"课程名称识别失败: {e}")
     return None
+
+def _discover_course_cards():
+    """返回当前弹窗中的课程卡片，顺序只由卡片时间决定。"""
+    region = _course_cards_region()
+    if not region:
+        return []
+    visual_cards = _detect_course_card_grid(region)
+    if visual_cards:
+        detail = " → ".join(
+            f"{card.get('date') or '未知日期'} {card.get('time') or '未知时间'}"
+            for card in visual_cards
+        )
+        log(f"  卡片网格识别: {detail}")
+        return visual_cards
+    cards = rank_course_cards(_ocr_items(region), region)
+    if not cards:
+        # 深色卡片上的小号时间文字容易被普通 OCR 漏掉，仅在失败时做一次增强扫描。
+        enhanced_items = _ocr_items(region, psm=6, preprocess="contrast", lang="eng")
+        cards = rank_course_cards(enhanced_items, region)
+        if cards:
+            log("  课表时间由增强 OCR 识别")
+    if cards:
+        log("  已发现课程: " + " → ".join(card["time"] for card in cards))
+    return cards
+
+def _detect_course_card_grid(region=None, image_bgr=None, offset=(0, 0)):
+    """针对微信小程序的缩略图网格，逐卡读取日期和起止时间。"""
+    if pytesseract is None:
+        return []
+    try:
+        if image_bgr is None:
+            pil_img, offset_x, offset_y = _grab_ocr_image(region)
+            rgb = np.array(pil_img.convert("RGB"))
+            bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+        else:
+            bgr = image_bgr
+            offset_x, offset_y = offset
+        height, width = bgr.shape[:2]
+        gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+        hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+        mask = np.where((gray < 225) | (hsv[:, :, 1] > 45), 255, 0).astype(np.uint8)
+        mask = cv2.morphologyEx(
+            mask,
+            cv2.MORPH_CLOSE,
+            cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7)),
+        )
+        count, _, stats, _ = cv2.connectedComponentsWithStats(mask, 8)
+        boxes = []
+        for index in range(1, count):
+            bx, by, bw, bh, area = (int(value) for value in stats[index])
+            if (
+                width * 0.18 < bw < width * 0.38
+                and height * 0.22 < bh < height * 0.58
+                and area > bw * bh * 0.25
+            ):
+                boxes.append((bx, by, bw, bh))
+        if not boxes:
+            return []
+
+        cards = []
+        for bx, by, bw, bh in boxes:
+            x0 = max(0, bx - 1)
+            y0 = max(0, by - 1)
+            x1 = min(width, bx + bw + 1)
+            y1 = min(height, by + bh + 2)
+            padded_height = y1 - y0
+            band = bgr[y0 + int(padded_height * 0.58): y1, x0:x1]
+            band_gray = cv2.cvtColor(band, cv2.COLOR_BGR2GRAY)
+            best_text = ""
+            best_stamp = None
+            best_score = -1
+            for threshold in (195, 200, 190, 210):
+                _, binary = cv2.threshold(band_gray, threshold, 255, cv2.THRESH_BINARY)
+                enlarged = cv2.resize(binary, None, fx=4, fy=4, interpolation=cv2.INTER_CUBIC)
+                raw = pytesseract.image_to_string(
+                    enlarged,
+                    lang="eng",
+                    config="--psm 7 -c tessedit_char_whitelist=0123456789:-",
+                ).strip()
+                stamp = parse_course_stamp(raw)
+                duration = None
+                if stamp and stamp.get("end_minute") is not None:
+                    duration = int(stamp["end_minute"]) - int(stamp["start_minute"])
+                score = (
+                    (2 if stamp and stamp.get("date") else 0)
+                    + (2 if stamp and stamp.get("start") else 0)
+                    + (2 if duration is not None and 20 <= duration <= 180 else 0)
+                    + len(raw) / 100
+                )
+                if score > best_score:
+                    best_text, best_stamp, best_score = raw, stamp, score
+                if score >= 6:
+                    break
+            stamp = best_stamp or {}
+            start_minute = int(stamp.get("start_minute", 24 * 60))
+            end_minute = stamp.get("end_minute")
+            duration_seconds = None
+            if end_minute is not None and 0 < int(end_minute) - start_minute < 8 * 60:
+                duration_seconds = (int(end_minute) - start_minute) * 60
+            cards.append({
+                "date": stamp.get("date", ""),
+                "time": stamp.get("start", ""),
+                "end": stamp.get("end", ""),
+                "minute": start_minute,
+                "month": int(stamp.get("month", 99)),
+                "day": int(stamp.get("day", 99)),
+                "duration_seconds": duration_seconds,
+                "cx": offset_x + bx + bw // 2,
+                "cy": offset_y + by + bh // 2,
+                "ocr": best_text,
+                "visual_y": by,
+                "visual_x": bx,
+            })
+        stamps_complete = all(
+            card.get("date")
+            and card.get("time")
+            and card.get("end")
+            and card.get("duration_seconds")
+            and 20 * 60 <= card["duration_seconds"] <= 180 * 60
+            for card in cards
+        )
+        if stamps_complete:
+            cards.sort(key=lambda card: (
+                card["month"], card["day"], card["minute"], card["visual_y"], card["visual_x"]
+            ))
+            log("  课程日期和起止时间均识别完整，按日期时间升序排列")
+        else:
+            # 智慧课堂的网格按“最近课程在前”从左到右、从上到下展示；
+            # 有任一卡片 OCR 不完整时，反向网格顺序比残缺时间排序可靠。
+            cards.sort(key=lambda card: (card["visual_y"], card["visual_x"]), reverse=True)
+            for card in cards:
+                card["stamp_reliable"] = bool(
+                    card.get("date")
+                    and card.get("time")
+                    and card.get("end")
+                    and card.get("duration_seconds")
+                    and 20 * 60 <= card["duration_seconds"] <= 180 * 60
+                )
+                if not card["stamp_reliable"]:
+                    card["date"] = card["time"] = card["end"] = ""
+                    card["duration_seconds"] = None
+            log("  部分课程时间 OCR 不完整，按课表倒序网格反排；忽略不可靠时间，避免误选卡片")
+        for lesson, card in enumerate(cards, start=1):
+            card["lesson"] = lesson
+        return cards
+    except Exception as e:
+        log(f"  微信课程卡片网格识别失败: {e}")
+        return []
 
 def _switch_dialog_close_point():
     """切换节次弹窗右上角关闭按钮。"""
@@ -770,6 +1354,40 @@ def _switch_dialog_close_point():
         return None
     x, y, w, h = region
     return (x + int(w * 0.94), y + int(h * 0.31))
+
+def _switch_dialog_header_region():
+    region = _locked_window_region()
+    if not region:
+        return None
+    x, y, w, h = region
+    return (x + int(w * 0.03), y + int(h * 0.28), int(w * 0.31), int(h * 0.09))
+
+def _close_switch_dialog(label="切换节次弹窗"):
+    """关闭选课弹窗并验证标题确实消失；失败时保留错误状态供上层停止。"""
+    if not _switch_dialog_open() and not _switch_dialog_have_week_tabs():
+        log(f"[{label}] 弹窗未打开，无需关闭")
+        return True
+    point = _switch_dialog_close_point()
+    if not point:
+        log(f"[{label}] 找不到弹窗右上角关闭按钮位置")
+        return False
+    if _config.get("interaction_mode") == "uia":
+        named_close = _uia_invoke_by_names(["关闭切换节次弹窗"], exact=True)
+        if named_close:
+            time.sleep(0.3)
+            if not _switch_dialog_open():
+                log(f"[{label}] 已通过 UI Automation 关闭切换节次弹窗")
+                return True
+    if not _strong_click(*point):
+        log(f"[{label}] 叉号点击调用失败 -> {point}")
+        return False
+    for _ in range(8):
+        time.sleep(0.2)
+        if not _switch_dialog_open():
+            log(f"[{label}] 已确认点击叉号并关闭弹窗")
+            return True
+    log(f"[{label}] 点击叉号后弹窗仍然显示")
+    return False
 
 def _build_simple_course_groups(weeks, base_clicks=None, skip_completed=True, duration_seconds=1500):
     """为简单模式生成：OCR 查找切换节次 -> 第X周 -> 第1/2节 -> 回放。"""
@@ -887,12 +1505,17 @@ def _find_text_target(keywords, search_region=None, exact=False):
         log(f"  OCR 异常: {e}")
         return None
 
-def _ocr_items(search_region=None, psm=None):
+def _ocr_items(search_region=None, psm=None, preprocess=None, lang=None):
     """返回 OCR 词块列表：text/conf/cx/cy/w/h。psm 可覆盖默认 --psm 11。"""
     if pytesseract is None:
         return []
     try:
         pil_img, offset_x, offset_y = _grab_ocr_image(search_region)
+        if preprocess == "contrast":
+            source = np.array(pil_img.convert("RGB"))
+            gray = cv2.cvtColor(source, cv2.COLOR_RGB2GRAY)
+            gray = cv2.createCLAHE(clipLimit=2.2, tileGridSize=(8, 8)).apply(gray)
+            pil_img = Image.fromarray(gray)
         if OCR_SCALE != 1:
             pil_img = pil_img.resize(
                 (int(pil_img.width * OCR_SCALE), int(pil_img.height * OCR_SCALE)),
@@ -901,7 +1524,7 @@ def _ocr_items(search_region=None, psm=None):
         config_str = f"--psm {psm}" if psm else "--psm 11"
         data = pytesseract.image_to_data(
             pil_img,
-            lang=OCR_LANG,
+            lang=lang or OCR_LANG,
             config=config_str,
             output_type=pytesseract.Output.DICT,
         )
@@ -948,6 +1571,8 @@ def _switch_title_region():
 
 def _current_switch_week():
     """读取切换节次弹窗标题里的当前周，例如【第3周】。"""
+    if not _switch_dialog_open():
+        return None
     region = _switch_title_region()
     if not region:
         return None
@@ -960,6 +1585,18 @@ def _current_switch_week():
         return week
     log(f"  当前标题周: 未识别 ({text[:30] or '无文字'})")
     return None
+
+def _current_switch_course_stamp():
+    """读取弹窗标题中的当前课程日期与开始时间。"""
+    region = _switch_title_region()
+    if not region:
+        return None
+    items = _ocr_items(region, psm=6)
+    raw = " ".join(str(item.get("raw", "")) for item in items)
+    stamp = parse_course_stamp(raw)
+    if stamp:
+        log(f"  当前课程标题: {stamp.get('date')} {stamp.get('start')}")
+    return stamp
 
 def _switch_button_region():
     """回放页右侧“切换节次”按钮所在区域，避免 OCR 误读左侧“5次”。"""
@@ -975,20 +1612,67 @@ def _switch_button_region():
     )
 
 def _switch_dialog_open():
-    if _current_switch_week() is not None:
-        return True
-    region = _switch_title_region()
+    # 必须看到弹窗自身的“切换节次”标题；课程页也可能包含周次数字，
+    # 单靠“第N周”判断会把已关闭的弹窗误判为仍打开。
+    region = _switch_dialog_header_region()
     if not region:
         return False
-    items = _ocr_items(region)
+    items = _ocr_items(region, psm=6)
     text = "".join(item["text"] for item in items)
-    return "切换节次" in text or "切换" in text
+    return "切换节次" in text or ("切换" in text and "节次" in text)
+
+def _second_meeting_start_index(cards):
+    """返回周内第二个上课日期对应的首条录播位置。"""
+    dates = [str(card.get("date") or "") for card in cards]
+    meeting_dates = []
+    for course_date in dates:
+        if course_date and (not meeting_dates or course_date != meeting_dates[-1]):
+            meeting_dates.append(course_date)
+    if len(meeting_dates) >= 2:
+        return next(index for index, course_date in enumerate(dates) if course_date == meeting_dates[1])
+    # 小程序卡片 OCR 偶尔只认出一个日期。此布局每个上课日通常有两节录播，
+    # 因而四张卡时第二个上课日从时间升序列表的第3张开始。
+    if len(cards) >= 3:
+        return min(2, len(cards) - 1)
+    return min(1, max(0, len(cards) - 1))
+
+def _switch_dialog_have_week_tabs(win=None):
+    """弹窗真正打开时，周按钮行一定会出现。
+    关闭动画期间标题还在、按钮行已消失，容易被 `_switch_dialog_open` 误判，
+    因此用“周按钮是否可见”作为二次确认。"""
+    win = win or _locked_window_region()
+    if not win:
+        return {}
+    try:
+        return _visible_week_buttons(win)
+    except Exception:
+        return {}
 
 def _open_switch_dialog():
     """打开切换节次弹窗：只在右侧按钮区域 OCR，避免全屏误点。"""
     if _switch_dialog_open():
-        log("  切换节次弹窗已打开")
-        return True
+        # 课程页上也有“切换节次”按钮，且弹窗关闭动画期间标题仍可被 OCR 到，
+        # 若直接相信标题就会跳过点击、随后周按钮识别失败。这里要求周按钮行
+        # 已出现才认为弹窗真的可用。
+        if _switch_dialog_have_week_tabs():
+            log("  切换节次弹窗已打开")
+            return True
+        for _ in range(6):
+            time.sleep(0.2)
+            if not _switch_dialog_open():
+                break
+            if _switch_dialog_have_week_tabs():
+                log("  切换节次弹窗已打开")
+                return True
+        if _switch_dialog_open():
+            log("  检测到“切换节次”标题但周按钮行不可见，按未打开处理，重新点击按钮")
+
+    if _uia_invoke_by_names(["切换节次"], exact=True):
+        for _ in range(10):
+            time.sleep(0.2)
+            if _switch_dialog_open():
+                log("  UIA 已打开切换节次弹窗")
+                return True
 
     search_region = _switch_button_region()
     if not search_region:
@@ -997,17 +1681,24 @@ def _open_switch_dialog():
     log(f"  OCR 在切换节次按钮区域查找: {search_region}")
     point = _find_text_target(["切换节次", "切换"], search_region=search_region)
     if point:
-        log(f"  OCR 命中切换节次 -> {point}")
-        _strong_click(*point)
-        # 弹窗可能需要时间渲染，最多等2秒
-        for _ in range(10):
-            time.sleep(0.2)
-            if _switch_dialog_open():
-                log("  弹窗已确认打开")
-                return True
+        # 弹窗可能需要时间渲染；小程序偶发吞掉第一次点击，重试一次。
+        for attempt in range(2):
+            log(f"  OCR 命中切换节次 -> {point}（第{attempt + 1}次点击）")
+            _strong_click(*point)
+            for _ in range(12):
+                time.sleep(0.2)
+                if _switch_dialog_open() or _switch_dialog_have_week_tabs():
+                    log("  弹窗已确认打开")
+                    return True
+            if attempt == 0:
+                log("  首次点击后弹窗未确认打开，稍后重试一次")
+                time.sleep(0.6)
+                refreshed = _find_text_target(["切换节次", "切换"], search_region=search_region)
+                if refreshed:
+                    point = refreshed
         log("  点击后弹窗未确认打开，可能跳转页面需要更长时间")
         time.sleep(1.0)
-        return _switch_dialog_open()
+        return _switch_dialog_open() or bool(_switch_dialog_have_week_tabs())
 
     # OCR未找到，用固定坐标兜底点击
     fallback = _switch_button_fallback_point()
@@ -1030,10 +1721,10 @@ def _course_cards_region():
         return None
     x, y, w, h = region
     return (
-        x + int(w * 0.02),
-        y + int(h * 0.42),
-        int(w * 0.65),
-        int(h * 0.20),
+        x + int(w * 0.03),
+        y + int(h * 0.43),
+        int(w * 0.94),
+        int(h * 0.31),
     )
 
 def _week_tabs_region(expanded=False):
@@ -1178,9 +1869,8 @@ def _parse_week_items(items):
         digits = re.sub(r"\D", "", it["text"])
         if not digits:
             continue
-        # 数字块大小过滤：周按钮数字≈10-20px宽×15-40px高
-        # 大块(>50px高或>80px宽)是垃圾文字或按钮背景，排除
-        if it["h"] > 50 or it["w"] > 80:
+        # 数字块大小过滤：周按钮数字≈8-25px宽×15-45px高，置信度要高。
+        if it["conf"] < 80 or it["w"] < 5 or it["w"] > 25 or it["h"] < 15 or it["h"] > 45:
             continue
         try:
             week = int(digits)
@@ -1197,45 +1887,200 @@ def _parse_week_items(items):
     return weeks
 
 def _check_blue_at(cx, cy):
-    """检测屏幕坐标(cx,cy)附近是否有蓝色像素（表示周按钮被选中）。"""
+    """从锁定窗口判断周按钮是否高亮，避免遮挡时误读桌面颜色。"""
     try:
-        bbox = (cx - 12, cy - 12, cx + 12, cy + 12)
-        img = ImageGrab.grab(bbox=bbox)
-        arr = np.array(img)
-        if arr.shape[2] < 3:
+        with _lock:
+            hwnd = state.get("target_hwnd")
+        if not hwnd or not is_window_visible(hwnd):
             return False
-        hsv = cv2.cvtColor(arr[:, :, :3], cv2.COLOR_RGB2HSV)
+        rect = wintypes.RECT()
+        if not _user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+            return False
+        image = capture_window(hwnd)
+        if image is None:
+            return False
+        x, y = int(cx - rect.left), int(cy - rect.top)
+        crop = image[max(0, y - 12):y + 12, max(0, x - 12):x + 12]
+        if crop.size == 0:
+            return False
+        hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
         blue_mask = cv2.inRange(hsv, (95, 40, 40), (135, 255, 255))
-        blue_count = blue_mask.sum() / 255
-        return blue_count > 20
+        # 静态截图上选中按钮约有 97 个高饱和蓝紫像素，未选中约 50 个。
+        return int(np.count_nonzero(blue_mask)) > 75
     except Exception:
         return False
 
-def _find_week_tab(week, tries=OCR_SCROLL_TRIES):
-    """用OCR找数字定位周按钮 + 颜色检测蓝色选中验证。
-    找到目标周 → 点击 → 检查该位置是否变蓝 → 变蓝说明点中了。
-    """
+def _visible_week_buttons(window_region):
+    """识别微信切换弹窗中的独立周次按钮，包括蓝色选中按钮。"""
+    wx, wy, ww, wh = window_region
+    search = (
+        wx + int(ww * 0.02),
+        wy + int(wh * 0.35),
+        int(ww * 0.96),
+        int(wh * 0.075),
+    )
     try:
-        _save_debug_screenshot("week_tab_enter")
-    except Exception:
-        pass
+        image, sx, sy = _grab_ocr_image(search)
+        bgr = cv2.cvtColor(np.asarray(image.convert("RGB")), cv2.COLOR_RGB2BGR)
+        gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+        edges = cv2.Canny(gray, 30, 100)
+        contours, _ = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+        boxes = []
+        for contour in contours:
+            x, y, w, h = cv2.boundingRect(contour)
+            if not (ww * 0.11 <= w <= ww * 0.24 and wh * 0.035 <= h <= wh * 0.075):
+                continue
+            if any(abs(x - old[0]) < 8 and abs(y - old[1]) < 8 for old in boxes):
+                continue
+            boxes.append((x, y, w, h))
+        buttons = {}
+        for x, y, w, h in sorted(boxes):
+            # 按钮里是完整的“第N周”。只识别数字时，选中态的蓝色“第1周”
+            # 会被误读成“51”，因此整块识别后从“第N周”里取周号。
+            content = bgr[
+                y + int(h * 0.15):y + int(h * 0.85),
+                x + int(w * 0.08):x + int(w * 0.92),
+            ]
+            if content.size == 0:
+                continue
+            enlarged = cv2.resize(content, None, fx=3, fy=3, interpolation=cv2.INTER_LINEAR)
+            text = pytesseract.image_to_string(
+                cv2.cvtColor(enlarged, cv2.COLOR_BGR2GRAY), lang=OCR_LANG, config="--psm 7"
+            )
+            match = re.search(r"第?\s*0?(\d{1,2})\s*周", text) or re.search(r"(\d{1,2})", text)
+            if not match:
+                continue
+            week = int(match.group(1))
+            if 1 <= week <= 16:
+                buttons[week] = (sx + x + w // 2, sy + y + h // 2)
+        return buttons
+    except Exception as e:
+        log(f"  周按钮版面识别失败: {e}")
+        return {}
 
+def _post_background_drag(start_x, start_y, end_x, end_y):
+    """在锁定窗口内部投递拖动消息，不移动用户的真实鼠标。"""
+    with _lock:
+        hwnd = state.get("target_hwnd")
+    if not hwnd or not is_window_visible(hwnd):
+        return False
+    rect = wintypes.RECT()
+    if not _user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+        return False
+    if not (rect.left <= start_x <= rect.right and rect.top <= start_y <= rect.bottom):
+        return False
+    target = hwnd
+    local = wintypes.POINT(int(start_x), int(start_y))
+    for _ in range(8):
+        probe = wintypes.POINT(int(start_x), int(start_y))
+        if not _user32.ScreenToClient(target, ctypes.byref(probe)):
+            break
+        child = _user32.ChildWindowFromPointEx(target, probe, 0x0001 | 0x0002 | 0x0004)
+        if not child or child == target:
+            break
+        target = child
+    if not _user32.ScreenToClient(target, ctypes.byref(local)):
+        target = hwnd
+        local = wintypes.POINT(int(start_x), int(start_y))
+        if not _user32.ScreenToClient(target, ctypes.byref(local)):
+            return False
+    end_local = wintypes.POINT(int(end_x), int(end_y))
+    if not _user32.ScreenToClient(target, ctypes.byref(end_local)):
+        return False
+    try:
+        start_lp = (local.y & 0xFFFF) << 16 | (local.x & 0xFFFF)
+        _user32.PostMessageW(target, 0x0200, 0, start_lp)
+        _user32.PostMessageW(target, 0x0201, 0x0001, start_lp)
+        for fraction in (0.25, 0.5, 0.75, 1.0):
+            x = int(local.x + (end_local.x - local.x) * fraction)
+            y = int(local.y + (end_local.y - local.y) * fraction)
+            lparam = (y & 0xFFFF) << 16 | (x & 0xFFFF)
+            _user32.PostMessageW(target, 0x0200, 0x0001, lparam)
+            time.sleep(0.025)
+        _user32.PostMessageW(target, 0x0202, 0, (end_local.y & 0xFFFF) << 16 | (end_local.x & 0xFFFF))
+        return True
+    except Exception as exc:
+        log(f"  周次列表后台滑动失败: {exc}")
+        return False
+
+def _scroll_week_tabs_toward(week, window_region, buttons):
+    """目标周不在当前可见标签时，尝试在标签行内后台横向滑动。"""
+    if not buttons:
+        return False
+    visible = sorted(buttons)
+    if visible[0] <= week <= visible[-1]:
+        return False
+    wx, wy, ww, wh = window_region
+    center_y = int(np.median([point[1] for point in buttons.values()]))
+    # 周按钮只占弹窗左侧区域。全窗口 88% 位置已经在课程卡片区，
+    # 从那里拖动不会滚动标签行。
+    left_edge = wx + int(ww * 0.05)
+    right_edge = wx + int(ww * 0.58)
+    if week > visible[-1]:
+        start_x, end_x = right_edge, left_edge
+        direction = "后"
+    else:
+        start_x, end_x = left_edge, right_edge
+        direction = "前"
+    log(
+        f"  第{week}周不在可见标签 {visible}，在标签区域"
+        f" y={center_y}、x={left_edge}-{right_edge} 向{direction}滑动"
+    )
+    return _post_background_drag(start_x, center_y, end_x, center_y)
+
+def _find_week_tab(week, tries=0):
+    """OCR找到目标周数字就点。OCR识别到的位置就是按钮位置，直接点。
+    点了就走，不验证——点周标题不变，re-OCR又可能假阴性。"""
     win = _locked_window_region()
     if not win:
         log(f"  未锁定窗口")
         return None
+    buttons = _visible_week_buttons(win)
+    if buttons:
+        # 周次通常横向滚动显示。最多滑动 8 次，每次都重新识别，
+        # 没有看到列表确实变化就停止，避免盲目连发输入。
+        previous = tuple(sorted(buttons))
+        for _ in range(8):
+            log(f"  可见周按钮: {list(previous)}")
+            if week in buttons:
+                point = buttons[week]
+                if _strong_click(*point):
+                    log(f"  已点击第{week}周按钮 -> {point}")
+                    return point
+                return None
+            if not _scroll_week_tabs_toward(week, win, buttons):
+                break
+            current = previous
+            for _ in range(6):
+                time.sleep(0.2)
+                buttons = _visible_week_buttons(win)
+                current = tuple(sorted(buttons))
+                if current and current != previous:
+                    break
+            if not current or current == previous:
+                log(f"  周次行滑动后没有识别到变化: {list(current)}")
+                break
+            previous = current
+    if _uia_invoke_by_names([f"第{week}周", f"{week}周"], exact=True):
+        time.sleep(0.4)
+        return (-1, -1)
     wx, wy, ww, wh = win
 
-    # ---- 只OCR按钮行(y=35%-48%)，排除标题和课程卡片 ----
     btn_y_min = wy + int(wh * 0.35)
     btn_y_max = wy + int(wh * 0.48)
-    ocr_region = (wx + int(ww * 0.02), btn_y_min, int(ww * 0.96), int(wh * 0.13))
+    ocr_region = (wx + int(ww * 0.02), btn_y_min, int(ww * 0.96), int(wh * 0.18))
 
     for attempt in range(tries + 1):
-        items = _ocr_items(ocr_region, psm=11)
-        found = _parse_week_items(items)
-        visible = {k: v for k, v in found.items() if btn_y_min <= v["cy"] <= btn_y_max}
-
+        visible = {}
+        for _ in range(2):
+            items = _ocr_items(ocr_region, psm=11)
+            found = _parse_week_items(items)
+            for k, v in found.items():
+                if btn_y_min <= v["cy"] <= btn_y_max:
+                    if k not in visible or v["conf"] > visible[k]["conf"]:
+                        visible[k] = v
+            if visible:
+                break  # 扫到结果了，不管有没有目标都够用了
         if not visible:
             log(f"  第{attempt+1}次: 按钮行未识别到数字")
             time.sleep(0.3)
@@ -1249,89 +2094,102 @@ def _find_week_tab(week, tries=OCR_SCROLL_TRIES):
             log(f"  找到第{week}周 -> ({target['cx']},{target['cy']}) 点击")
             _strong_click(target["cx"], target["cy"])
             time.sleep(0.5)
-            # 用蓝色检测验证：目标位置变蓝说明点中了
-            if _check_blue_at(target["cx"], target["cy"]):
-                log(f"  蓝色确认: 第{week}周按钮已选中")
-                return (target["cx"], target["cy"])
-            # 点偏了？尝试偏移3个不同位置
-            for dx, dy in [(5, 0), (-5, 0), (0, 8)]:
-                _strong_click(target["cx"] + dx, target["cy"] + dy)
-                time.sleep(0.3)
-                if _check_blue_at(target["cx"], target["cy"]):
-                    log(f"  偏移点击({dx},{dy})命中第{week}周")
-                    return (target["cx"] + dx, target["cy"] + dy)
-            log(f"  点击第{week}周但未出现蓝色选中，可能位置不准")
+            return (target["cx"], target["cy"])
 
-        # 目标周不在可见列表，点击最左/右侧按钮翻页
-        if attempt < tries:
-            if week < vis_sorted[0]:
-                log(f"  第{week}周 < 最小{vis_sorted[0]}，点左侧周翻页")
-                _click_week_scroll_arrow("left")
-            else:
-                log(f"  第{week}周 > 最大{vis_sorted[-1]}，点右侧周翻页")
-                _click_week_scroll_arrow("right")
+        inferred = interpolate_sequence_position(week, visible)
+        if inferred:
+            log(f"  OCR 漏掉第{week}周，根据相邻周间距推算 -> {inferred}")
+            _strong_click(*inferred)
+            time.sleep(0.5)
+            return inferred
 
-    log(f"  翻页{tries+1}次后未找到第{week}周，跳过")
+        # 微信小程序这里没有翻页箭头，点击边缘只会误选课程周。
+        log(f"  第{week}周不在当前周按钮中，可见={vis_sorted}")
+        break
+
+    log(f"  扫描周按钮后未找到第{week}周，跳过")
     return None
 
 
 def _select_week_tab(week):
-    """选择目标周；如果标题已是目标周，直接认为成功。"""
-    current = _current_switch_week()
-    if current == week:
-        log(f"  当前已是第{week}周，不重复点击周按钮")
+    """选择目标周；优先点OCR识别到的周按钮，标题只做兜底。"""
+    win = _locked_window_region()
+    buttons = _visible_week_buttons(win) if win else {}
+    if week in buttons and _check_blue_at(*buttons[week]):
+        log(f"  第{week}周按钮已高亮，当前已选中")
         return True
     point = _find_week_tab(week)
+    if point == "past_end":
+        return "past_end"
     if point == "skip":
         return "skip"
     if not point:
-        # 找不到按钮，再确认一次标题
+        # 找不到按钮时，标题相同只作为“可能已选中”的兜底，不提前跳过OCR扫描。
         current = _current_switch_week()
         if current == week:
             log(f"  虽然找不到按钮，但标题已是第{week}周，继续")
             return True
         log(f"  未找到第{week}周按钮，标题={current}，跳过避免播放错误周内容")
         return "skip"  # 跳过而不是盲目继续
-    _strong_click(*point)
-    time.sleep(0.8)
-    current = _current_switch_week()
-    if current == week:
-        log(f"  已确认切到第{week}周")
-        return True
-    log(f"  已点击第{week}周按钮，标题确认结果: {current if current is not None else '未识别'}")
-    # 有些页面点击同一周不会改变标题，但下面卡片已经可见；允许继续。
-    return True
+    for _ in range(4):
+        time.sleep(0.2)
+        if point[0] >= 0 and _check_blue_at(*point):
+            log(f"  第{week}周按钮已高亮，确认已切到第{week}周")
+            return True
+        if _current_switch_week() == week:
+            log(f"  已确认切到第{week}周")
+            return True
+    log(f"  点击后仍未确认第{week}周，跳过以免处理错误课程")
+    return "skip"
 
 
 def _ensure_week_selected(week):
     """确保弹窗处于目标周；缺课或无法切换返回 'skip'。
-    如果标题周已经是目标周就直接成功；
-    如果找不到目标周按钮且标题不匹配，跳过本节避免播放错误周内容。
+
+    关键：点击周标签后，弹窗标题（【第N周】...）显示的是正在播放的课程，
+    不会随标签切换即时刷新，所以以按钮高亮为主要判据，标题仅作兜底。
     """
-    current = _current_switch_week()
-    if current == week:
-        log(f"  已在第{week}周")
+    win = _locked_window_region()
+    buttons = _visible_week_buttons(win) if win else {}
+    if week in buttons and _check_blue_at(*buttons[week]):
+        log(f"  第{week}周按钮已高亮，当前已选中")
         return True
+
     point = _find_week_tab(week)
+    if point == "past_end":
+        return "past_end"
     if point == "skip":
         return "skip"
     if not point:
-        # _find_week_tab 返回 None，但标题可能是目标周（OCR误识别）
-        # 再确认一次标题
+        # 按钮完全识别不出来时，标题是唯一线索。
         current = _current_switch_week()
         if current == week:
             log(f"  虽然找不到按钮，但标题已是第{week}周，继续")
             return True
         log(f"  无法定位第{week}周按钮，标题={current}，跳过本节避免播放错误周内容")
         return "skip"
-    _strong_click(*point)
-    time.sleep(0.8)
-    current = _current_switch_week()
-    if current == week:
-        log(f"  已切到第{week}周")
-    else:
-        log(f"  点击第{week}周后标题={current if current is not None else '未识别'}，继续尝试课表卡片")
-    return True
+
+    # 周标签切换不刷新标题，优先用按钮高亮确认，标题作为兜底。
+    for _ in range(4):
+        time.sleep(0.2)
+        if point[0] >= 0 and _check_blue_at(*point):
+            log(f"  第{week}周按钮已高亮，确认已切到第{week}周")
+            return True
+        if _current_switch_week() == week:
+            log(f"  已确认切到第{week}周")
+            return True
+    # 窗口消息可能被 WebView 忽略；再尝试按可访问性名称调用一次。
+    if _uia_invoke_by_names([f"第{week}周", f"第{week:02d}周", f"{week}周"], exact=True):
+        for _ in range(5):
+            time.sleep(0.2)
+            if point[0] >= 0 and _check_blue_at(*point):
+                log(f"  通过 UI Automation 后按钮高亮，确认切到第{week}周")
+                return True
+            if _current_switch_week() == week:
+                log(f"  通过 UI Automation 确认切到第{week}周")
+                return True
+    log(f"  点击后仍未确认第{week}周；停止自动流程，不从当前周继续")
+    return "skip"
 
 def _has_course_cards():
     region = _course_cards_region()
@@ -1363,18 +2221,219 @@ def _find_text_target_with_scroll(keywords, search_region=None, tries=OCR_SCROLL
 def _ocr_ready():
     if pytesseract is None:
         return False, "未安装 pytesseract"
+    if not TESSERACT_CMD or not os.path.isfile(TESSERACT_CMD):
+        return False, (
+            "未找到 Tesseract OCR。请安装后加入 PATH，或放在项目目录的 "
+            "tools/Tesseract-OCR/tesseract.exe"
+        )
     try:
         _ = pytesseract.get_tesseract_version()
+        langs = _available_ocr_langs()
+        if "chi_sim" not in langs:
+            return False, (
+                "Tesseract 已找到，但缺少简体中文语言包 chi_sim.traineddata。"
+                "请将其放入项目目录 tessdata 文件夹"
+            )
         return True, f"OCR 可用({OCR_LANG})"
     except Exception as e:
         return False, f"Tesseract 不可用: {e}"
 
+def _classify_slide(frame):
+    """两阶段路由：快速视觉模型 + OCR 文字区域外结构检查。"""
+    decision = _vision_router.predict(frame)
+    if pytesseract is None:
+        return decision
+    try:
+        height, width = frame.shape[:2]
+        scale = min(1.0, 1000.0 / max(1, width))
+        sample = cv2.resize(
+            frame,
+            (max(1, int(width * scale)), max(1, int(height * scale))),
+            interpolation=cv2.INTER_AREA,
+        )
+        data = pytesseract.image_to_data(
+            sample,
+            lang=OCR_LANG,
+            config="--psm 11",
+            output_type=pytesseract.Output.DICT,
+        )
+        boxes = []
+        confidences = []
+        for index, raw in enumerate(data.get("text", [])):
+            if not str(raw).strip():
+                continue
+            try:
+                confidence = float(data["conf"][index])
+            except (TypeError, ValueError):
+                confidence = -1
+            if confidence < 25:
+                continue
+            boxes.append((
+                int(data["left"][index]),
+                int(data["top"][index]),
+                int(data["width"][index]),
+                int(data["height"][index]),
+            ))
+            confidences.append(confidence)
+        return _vision_router.refine_with_text_regions(
+            sample,
+            decision,
+            boxes,
+            float(np.mean(confidences)) if confidences else 0.0,
+        )
+    except Exception as e:
+        log(f"  OCR/多模态二次分类失败，使用快速模型结果: {e}")
+        return decision
+
+def _uia_invoke_control(control):
+    current = control
+    for _ in range(4):
+        try:
+            invoke = current.GetPattern(windows_uia.PatternId.InvokePattern)
+            if invoke and invoke.Invoke(0):
+                return True
+        except Exception:
+            pass
+        try:
+            legacy = current.GetLegacyIAccessiblePattern()
+            if legacy and legacy.DoDefaultAction(0):
+                return True
+        except Exception:
+            pass
+        current = current.GetParentControl()
+        if not current:
+            break
+    return False
+
+def _uia_invoke_by_names(names, exact=False, max_nodes=900):
+    """在锁定窗口的可访问性树中按名称调用控件。"""
+    if windows_uia is None or _config.get("interaction_mode") != "uia":
+        return False
+    keys = [re.sub(r"\s+", "", str(name)).lower() for name in names if str(name).strip()]
+    with _lock:
+        hwnd = state.get("target_hwnd")
+    if not hwnd or not keys:
+        return False
+    try:
+        with windows_uia.UIAutomationInitializerInThread():
+            root = windows_uia.ControlFromHandle(int(hwnd))
+            if not root:
+                return False
+            candidates = []
+            for index, (control, depth) in enumerate(windows_uia.WalkControl(root, includeTop=False, maxDepth=16)):
+                if index >= max_nodes:
+                    break
+                try:
+                    raw_name = str(control.Name or "")
+                except Exception:
+                    continue
+                normalized = re.sub(r"\s+", "", raw_name).lower()
+                if not normalized:
+                    continue
+                matched = next(
+                    (key for key in keys if normalized == key or (not exact and (key in normalized or normalized in key))),
+                    None,
+                )
+                if matched:
+                    candidates.append((0 if normalized == matched else 1, depth, control, raw_name))
+            for _, _, control, raw_name in sorted(candidates, key=lambda item: (item[0], item[1])):
+                if _uia_invoke_control(control):
+                    log(f"  UIA 名称调用成功: {raw_name!r}")
+                    return True
+    except Exception as e:
+        log(f"  UIA 名称查找失败: {e}")
+    return False
+
+def _uia_invoke_at_point(x, y):
+    """通过 Windows UI Automation 调用控件，不移动鼠标也不发送坐标点击。"""
+    if windows_uia is None:
+        return False
+    with _lock:
+        target_hwnd = state.get("target_hwnd")
+    if not target_hwnd or not is_window_visible(target_hwnd):
+        return False
+    try:
+        with windows_uia.UIAutomationInitializerInThread():
+            control = windows_uia.ControlFromPoint(int(x), int(y))
+            if not control:
+                return False
+            top = control.GetTopLevelControl()
+            top_hwnd = int(top.NativeWindowHandle or 0) if top else 0
+            if top_hwnd and top_hwnd != int(target_hwnd):
+                target_root = int(_user32.GetAncestor(target_hwnd, 2) or target_hwnd)
+                control_root = int(_user32.GetAncestor(top_hwnd, 2) or top_hwnd)
+                if control_root != target_root:
+                    return False
+
+            if _uia_invoke_control(control):
+                return True
+    except Exception as e:
+        log(f"  UIA 后台调用失败: {e}")
+    return False
+
+def _post_background_click(x, y):
+    """向锁定窗口投递点击消息；成功时不会移动用户鼠标。"""
+    with _lock:
+        hwnd = state.get("target_hwnd")
+    if not hwnd or not is_window_visible(hwnd):
+        return False
+    point = wintypes.POINT(int(x), int(y))
+    rect = wintypes.RECT()
+    if not _user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+        return False
+    if not (rect.left <= point.x <= rect.right and rect.top <= point.y <= rect.bottom):
+        return False
+    # 从锁定窗口内部递归寻找渲染子窗口，不受其他前台窗口遮挡影响。
+    target = hwnd
+    for _ in range(8):
+        local = wintypes.POINT(point.x, point.y)
+        if not _user32.ScreenToClient(target, ctypes.byref(local)):
+            break
+        child = _user32.ChildWindowFromPointEx(target, local, 0x0001 | 0x0002 | 0x0004)
+        if not child or child == target:
+            break
+        target = child
+    client_point = wintypes.POINT(point.x, point.y)
+    if not _user32.ScreenToClient(target, ctypes.byref(client_point)):
+        target = hwnd
+        client_point = wintypes.POINT(point.x, point.y)
+        if not _user32.ScreenToClient(target, ctypes.byref(client_point)):
+            return False
+    lparam = (client_point.y & 0xFFFF) << 16 | (client_point.x & 0xFFFF)
+    try:
+        _user32.PostMessageW(target, 0x0200, 0, lparam)  # WM_MOUSEMOVE
+        _user32.PostMessageW(target, 0x0201, 0x0001, lparam)  # WM_LBUTTONDOWN
+        time.sleep(0.025)
+        _user32.PostMessageW(target, 0x0202, 0, lparam)  # WM_LBUTTONUP
+        return True
+    except Exception:
+        return False
+
 def _strong_click(x, y):
-    """比普通 click 稍稳的点击：先移动，再短按抬起。"""
+    """按配置使用 UIA/窗口消息或真实鼠标。"""
+    mode = str(_config.get("interaction_mode", "foreground"))
+    if mode == "uia":
+        # 微信小程序的渲染节点通常没有独立 UIA 句柄，优先把消息发送给
+        # 命中的最深层渲染子窗口；有名称的控件仍由 _uia_invoke_by_names 调用。
+        if _post_background_click(x, y):
+            with _lock:
+                state["background_clicks"] += 1
+            log(f"  无鼠标窗口调用 -> ({int(x)},{int(y)})")
+            return True
+        if _uia_invoke_at_point(x, y):
+            with _lock:
+                state["background_clicks"] += 1
+            log(f"  UIA 无鼠标调用 -> ({int(x)},{int(y)})")
+            return True
+        log(f"  无鼠标控制无法调用 ({int(x)},{int(y)})，未抢占真实鼠标")
+        return False
     pyautogui.moveTo(x, y, duration=0.05)
     pyautogui.mouseDown(x, y)
     time.sleep(CLICK_HOLD_SECONDS)
     pyautogui.mouseUp(x, y)
+    with _lock:
+        state["foreground_clicks"] += 1
+    return True
 
 def _step_search_region(step):
     area = step.get("search_area")
@@ -1437,11 +2496,14 @@ def _do_sequence(clicks, label="", group_name=""):
             week_slot = int(step.get("week_slot", 0))
             log(f"[{label}] 点击 {i+1}/{len(clicks)}: 解析周按钮 -> 第{week_slot}周")
             point = _find_week_tab(week_slot)
+            if point == "past_end":
+                log(f"[{label}] 第{week_slot}周超过最后可用周，跳过")
+                return "skip"
             if point == "skip":
                 log(f"[{label}] 第{week_slot}周不在课程周列表中，跳过本节")
                 return "skip"
             if not point:
-                # _find_week_tab 内部已有卡住检测，返回None说明确实无法定位
+                # 找不到按钮时，标题相同只作为兜底；不要在成功后重复点击周按钮。
                 current = _current_switch_week()
                 if current == week_slot:
                     log(f"[{label}] 虽然找不到周按钮，标题已为第{week_slot}周，跳过点击继续")
@@ -1455,6 +2517,8 @@ def _do_sequence(clicks, label="", group_name=""):
             actual_cx, actual_cy = point
             used_ocr = True
             log(f"[{label}] 周按钮定位完成: 第{week_slot}周 -> ({actual_cx},{actual_cy})")
+            time.sleep(delay)
+            continue
         elif mode == "course_card":
             lesson_slot = int(step.get("lesson_slot", 1))
             _has_course_cards()
@@ -1733,72 +2797,342 @@ def play_all_groups():
             state["playing"] = False
             state["playing_all"] = False
 
-def _simple_wait_course(name, duration):
-    log(f"[{name}] 按课程时长监测 {duration:.0f}s...")
-    waited = 0
-    report_interval = max(60, int(duration / 10))
-    while waited < duration:
+def _simple_wait_course(name, duration, prepared_plan=None, prepared_speed=None):
+    speed_mode = str(_config.get("playback_speed", "auto"))
+    try:
+        tail_seconds = max(0.0, float(_config.get("speed_tail_seconds", 90)))
+    except (TypeError, ValueError):
+        tail_seconds = 90.0
+    plan = prepared_plan or build_speed_plan(duration, speed_mode, tail_seconds)
+    current_speed = float(prepared_speed) if prepared_speed is not None else 1.0
+    plan_index = 0
+    if plan and prepared_speed is None:
+        requested = plan[0][1]
+        current_speed = requested if _apply_playback_speed(requested) else 1.0
+    log(f"[{name}] 按课程内容时长监测 {duration:.0f}s | 倍速计划={plan}")
+    source_elapsed = 0.0
+    wall_elapsed = 0.0
+    last_report = -1
+    while source_elapsed < duration:
         with _lock:
             if not state["playing"] or not state["playing_all"]:
                 return False
-        sleep_chunk = min(1, duration - waited)
+        if plan_index + 1 < len(plan) and source_elapsed >= plan[plan_index + 1][0]:
+            plan_index += 1
+            requested = plan[plan_index][1]
+            current_speed = requested if _apply_playback_speed(requested) else current_speed
+        sleep_chunk = min(1.0, max(0.05, (duration - source_elapsed) / max(current_speed, 0.5)))
         time.sleep(sleep_chunk)
-        waited += sleep_chunk
-        if int(waited) % report_interval == 0 and waited > 0:
-            log(f"[{name}] 监测中... 已运行 {waited:.0f}s / {duration:.0f}s")
+        wall_elapsed += sleep_chunk
+        source_elapsed += sleep_chunk * current_speed
+        progress_bucket = int(source_elapsed // max(60.0, duration / 10.0))
+        if progress_bucket > last_report and source_elapsed >= 60:
+            last_report = progress_bucket
+            log(f"[{name}] 监测中... 课程进度 {min(source_elapsed, duration):.0f}/{duration:.0f}s，实际用时 {wall_elapsed:.0f}s，{current_speed:g}×")
     return True
 
-def _run_simple_course(week, lesson, region, duration):
-    name = f"第{week:02d}周_第{lesson}节"
-    log(f"[{name}] 1/4 打开切换节次")
-    if not _open_switch_dialog():
-        log(f"[{name}] 打不开切换节次弹窗，停止")
-        return False
-    if not _switch_dialog_open():
-        log(f"[{name}] 已点击切换节次，但未确认弹窗打开，停止")
-        return False
+def _playback_controls_region():
+    region = _locked_window_region()
+    if not region:
+        return None
+    x, y, w, h = region
+    # 微信小程序的主屏/倍速行位于课件画面下方，约窗口高度 40%-56%。
+    return (x + int(w * 0.76), y + int(h * 0.42), int(w * 0.22), int(h * 0.13))
 
-    log(f"[{name}] 2/4 选择第{week}周")
+def _playback_speed_menu_region():
+    region = _locked_window_region()
+    if not region:
+        return None
+    x, y, w, h = region
+    # 微信下拉菜单向下展开；2.0x 位于约 75% 高度。
+    return (x + int(w * 0.75), y + int(h * 0.49), int(w * 0.23), int(h * 0.31))
+
+def _parse_speed_value(text):
+    normalized = str(text or "").lower().replace("×", "x").replace("倍", "x")
+    match = re.search(r"(?<!\d)(0\.5|0\.75|1(?:\.0)?|1\.25|1\.5|2(?:\.0)?|3(?:\.0)?)\s*x", normalized)
+    return float(match.group(1)) if match else None
+
+def _find_speed_value(speed=None, region=None):
+    """返回 (倍速值, 屏幕坐标)，专门识别微信的 1.0x 数字控件。"""
+    region = region or _playback_controls_region()
+    if not region:
+        return None
+    items = _ocr_items(region, psm=11, lang="eng")
+    candidates = []
+    for item in items:
+        value = _parse_speed_value(item.get("raw", ""))
+        if value is None:
+            continue
+        if speed is not None and abs(value - float(speed)) > 0.01:
+            continue
+        candidates.append((float(item.get("conf", 0)), value, item["cx"], item["cy"]))
+    if not candidates:
+        return None
+    _, value, cx, cy = max(candidates)
+    return value, (cx, cy)
+
+def _apply_playback_speed_unpaused(speed):
+    """通过播放器文字控件设置倍速；失败时保持当前速度并安全退回 1×计时。"""
+    speed = max(0.5, min(3.0, float(speed)))
+    speed_labels = [
+        f"{speed:g}x", f"{speed:g}×", f"{speed:.1f}x", f"{speed:.1f}×",
+        f"{speed:g}倍", f"{speed:.1f}倍",
+    ]
+    region = _playback_controls_region()
+    if not region:
+        return False
+    if _config.get("interaction_mode") == "foreground":
+        sx, sy, sw, sh = region
+        pyautogui.moveTo(sx + sw // 2, sy + sh - 12, duration=0.08)
+        time.sleep(0.35)
+    current = _find_speed_value(region=region)
+    if current and abs(current[0] - speed) < 0.01:
+        with _lock:
+            state["current_speed"] = speed
+        log(f"  当前已经是 {speed:g}×")
+        return True
+    menu_region = _playback_speed_menu_region()
+    # 上次未能选择选项时菜单可能仍然打开；先检查现有菜单。
+    option_match = _find_speed_value(speed=speed, region=menu_region) if not current else None
+    if option_match is None:
+        trigger = current[1] if current else _find_text_target(
+            ["倍速", "播放速度", "速度"], search_region=region
+        )
+        if not trigger:
+            log(f"  未找到 1.0x/倍速下拉框，保持 1× 计时（计划 {speed:g}×）")
+            _save_debug_screenshot("speed_control_missing")
+            return False
+        if not _strong_click(*trigger):
+            return False
+        time.sleep(0.5)
+        option_match = _find_speed_value(speed=speed, region=menu_region)
+    option = option_match[1] if option_match else None
+    if not option:
+        option = _find_text_target(
+            speed_labels,
+            search_region=menu_region,
+            exact=False,
+        )
+    if not option:
+        log(f"  已打开倍速菜单，但找不到 {speed:g}× 选项")
+        _save_debug_screenshot("speed_menu_missing")
+        return False
+    if not _strong_click(*option):
+        return False
+    for _ in range(4):
+        time.sleep(0.3)
+        verified = _find_speed_value(speed=speed, region=region)
+        if verified:
+            with _lock:
+                state["current_speed"] = speed
+            log(f"  播放速度已验证为 {speed:g}×")
+            return True
+    log(f"  已点击 {speed:g}×，但控件数值没有变化，按 1× 计时")
+    _save_debug_screenshot("speed_verify_failed")
+    return False
+
+def _apply_playback_speed(speed):
+    """切倍速期间暂停翻页检测，避免把播放器菜单误存成课件页。"""
+    with _lock:
+        should_pause = bool(state.get("monitoring"))
+        if should_pause:
+            state["capture_paused"] = True
+    try:
+        return _apply_playback_speed_unpaused(speed)
+    finally:
+        if should_pause:
+            with _lock:
+                active_region = state.get("region")
+            if active_region and _config.get("interaction_mode") == "foreground":
+                rx, ry, rw, rh = active_region
+                pyautogui.moveTo(rx + rw // 2, ry + rh + 10, duration=0.1)
+            time.sleep(0.25)
+            with _lock:
+                state["capture_paused"] = False
+
+def _discover_week_course_cards(week):
+    """打开目标周并预读全部课程卡；保留弹窗供第一节直接使用。"""
+    if not _open_switch_dialog():
+        return None
     selected = _ensure_week_selected(week)
+    if selected == "past_end":
+        return "past_end"
     if selected == "skip":
-        log(f"[{name}] 第{week}周不在课程列表中，跳过")
         return "skip"
     if not selected:
-        log(f"[{name}] 找不到第{week}周，停止")
-        return False
+        return None
+    time.sleep(0.35)
+    cards = _discover_course_cards()
+    return cards
+
+def _simple_course_name(week, lesson, card_hint):
+    """构建“第NN周_第N节_日期_起止”会话名。"""
+    name_parts = [f"第{week:02d}周", f"第{lesson}节"]
+    if card_hint:
+        if card_hint.get("date"):
+            name_parts.append(str(card_hint["date"]))
+        if card_hint.get("time"):
+            time_range = str(card_hint["time"]).replace(":", "-")
+            if card_hint.get("end"):
+                time_range += "-" + str(card_hint["end"]).replace(":", "-")
+            name_parts.append(time_range)
+    return "_".join(name_parts)
+
+def _run_simple_course(
+    week,
+    lesson,
+    region,
+    duration,
+    card_hint=None,
+    dialog_ready=False,
+    week_selected_hint=False,
+    use_card_duration=True,
+):
+    name = _simple_course_name(week, lesson, card_hint)
+    detected_duration = card_hint.get("duration_seconds") if card_hint else None
+    if detected_duration and use_card_duration:
+        effective_duration = float(detected_duration)
+        log(f"[{name}] 根据卡片起止时间得到课程时长 {effective_duration:.0f}s")
+    else:
+        effective_duration = float(duration)
+        if detected_duration:
+            log(
+                f"[{name}] 已关“按卡片时长监测”，使用界面设定时长 "
+                f"{effective_duration:.0f}s（卡片时长为 {detected_duration:.0f}s）"
+            )
+    if dialog_ready:
+        log(f"[{name}] 1-2/4 复用已识别的第{week}周课程列表")
+    else:
+        log(f"[{name}] 1/4 打开切换节次")
+        if not _open_switch_dialog():
+            log(f"[{name}] 打不开切换节次弹窗，停止")
+            return False
+        if not _switch_dialog_open():
+            log(f"[{name}] 已点击切换节次，但未确认弹窗打开，停止")
+            return False
+
+        if week_selected_hint:
+            log(f"[{name}] 2/4 沿用刚才确认的第{week}周，跳过重复 OCR")
+        else:
+            log(f"[{name}] 2/4 选择第{week}周")
+            selected = _ensure_week_selected(week)
+            if selected == "skip":
+                log(f"[{name}] 第{week}周不在课程列表中，跳过")
+                return "skip"
+            if not selected:
+                log(f"[{name}] 找不到第{week}周，停止")
+                return False
 
     log(f"[{name}] 3/4 点击第{lesson}节课表卡片")
     _run_on_main(_show_toast, f"{name}: 3/4 点课表卡片", '#89b4fa', 1800)
     _has_course_cards()
-    point = _course_card_point(lesson)
+    point = (card_hint["cx"], card_hint["cy"]) if card_hint else _course_card_point(lesson)
     if not point:
         log(f"[{name}] 无法计算课表卡片位置")
+        _close_switch_dialog(name)
         return False
-    _strong_click(*point)
+    # 点击前先记下弹窗标题（表示“正在播放的课程”），
+    # 点击后若标题变了，就证明点卡确实切了课程。
+    before_stamp = _current_switch_course_stamp()
+    if not _strong_click(*point):
+        log(f"[{name}] 课程卡片调用失败")
+        _close_switch_dialog(name)
+        return False
     time.sleep(1.0)
+    # 弹窗标题是干净大字，比卡片照片上的时间准得多。
+    # 卡片 OCR 经常读不出日期/时间，这时用标题校准，避免会话名缺时间和时长回退错值。
+    current_stamp = None
+    for _ in range(6):
+        current_stamp = _current_switch_course_stamp()
+        if current_stamp and current_stamp.get("date") and current_stamp.get("start"):
+            break
+        time.sleep(0.3)
+    card_has_stamp = bool(card_hint and card_hint.get("date") and card_hint.get("time"))
+    current_key = (
+        (current_stamp.get("date"), current_stamp.get("start")) if current_stamp else None
+    )
+    before_key = (
+        (before_stamp.get("date"), before_stamp.get("start")) if before_stamp else None
+    )
+    expected_key = (card_hint.get("date"), card_hint.get("time")) if card_has_stamp else None
+    if not current_key:
+        log(f"[{name}] 点击后读不到课程标题，无法确认已选课程，停止")
+        _close_switch_dialog(name)
+        return False
+    if card_has_stamp and current_key == expected_key:
+        pass  # 卡片时间与标题完全一致，无需校准
+    elif card_has_stamp and current_key == before_key:
+        # 标题没变化 = 点卡没生效（而不是 OCR 读错），才是真失败。
+        log(
+            f"[{name}] 课程选择未生效：期望 {card_hint.get('date')} {card_hint.get('time')}，"
+            f"实际 {current_key}，停止"
+        )
+        _close_switch_dialog(name)
+        return False
+    else:
+        if card_has_stamp:
+            log(
+                f"[{name}] 卡片时间 {card_hint.get('date')} {card_hint.get('time')} 与标题 "
+                f"{current_key[0]} {current_key[1]} 不一致，以标题为准校准"
+            )
+        adopted = dict(card_hint or {})
+        adopted["date"] = current_stamp["date"]
+        adopted["time"] = current_stamp["start"]
+        adopted["end"] = current_stamp.get("end") or ""
+        adopted_duration = None
+        if current_stamp.get("end_minute") is not None:
+            diff = int(current_stamp["end_minute"]) - int(current_stamp["start_minute"])
+            if 0 < diff < 8 * 60:
+                adopted_duration = diff * 60
+        adopted["duration_seconds"] = adopted_duration
+        card_hint = adopted
+        name = _simple_course_name(week, lesson, card_hint)
+        if adopted_duration and use_card_duration:
+            effective_duration = float(adopted_duration)
+        log(
+            f"[{name}] 已用弹窗标题校准：{card_hint['date']} "
+            f"{card_hint['time']}-{card_hint['end']}，监测 {effective_duration:.0f}s"
+        )
 
     log(f"[{name}] 4/4 关闭切换节次弹窗")
-    point = _switch_dialog_close_point()
-    if not point:
-        log(f"[{name}] 无法计算关闭按钮位置")
+    if not _close_switch_dialog(name):
+        log(f"[{name}] 不能确认关闭弹窗，停止以避免截错课程")
         return False
-    _strong_click(*point)
-    time.sleep(1.0)
 
-    # 鼠标移到监控区域下方，避免挡住PPT内容
-    if region:
+    with _lock:
+        # 不假设播放器会在切课后保留上一节的倍速状态。
+        state["current_speed"] = -1.0
+
+    speed_mode = str(_config.get("playback_speed", "auto"))
+    try:
+        tail_seconds = max(0.0, float(_config.get("speed_tail_seconds", 90)))
+    except (TypeError, ValueError):
+        tail_seconds = 90.0
+    speed_plan = build_speed_plan(effective_duration, speed_mode, tail_seconds)
+    requested_speed = speed_plan[0][1] if speed_plan else 1.0
+    actual_speed = requested_speed if _apply_playback_speed(requested_speed) else 1.0
+
+    with _lock:
+        if not state["playing"] or not state["playing_all"]:
+            return False
+
+    # 倍速菜单处理完再移走鼠标，避免控件悬浮层出现在首张课件图里。
+    if region and _config.get("interaction_mode") == "foreground":
         rx, ry, rw, rh = region
         pyautogui.moveTo(rx + rw // 2, ry + rh + 10, duration=0.1)
+        time.sleep(0.2)
         log(f"  鼠标移到监控区域下方: ({rx + rw // 2}, {ry + rh + 10})")
 
     log(f"[{name}] 开始监控 PPT 区域")
     _start_monitoring(region, name)
-    _simple_wait_course(name, duration)
+    _simple_wait_course(name, effective_duration, prepared_plan=speed_plan, prepared_speed=actual_speed)
     log(f"[{name}] 停止监控")
     _stop_monitoring()
     return True
 
-def run_simple_auto_courses(weeks, duration, skip_completed=True):
+def run_simple_auto_courses(weeks, duration, skip_completed=True, use_card_duration=None):
+    if use_card_duration is None:
+        use_card_duration = bool(_config.get("simple_use_card_duration", True))
     with _lock:
         if state["playing"]:
             log("正在执行中，请先停止")
@@ -1808,19 +3142,74 @@ def run_simple_auto_courses(weeks, duration, skip_completed=True):
         state["playing_all"] = True
     _stop_monitoring()
     completed_lessons, _ = _scan_completed_week_lessons()
+    log(f"[简单模式] 本次指定周次（升序）: {', '.join(map(str, weeks))}")
     try:
         for week in weeks:
-            for lesson in SIMPLE_LESSONS:
+            cards = _discover_week_course_cards(week)
+            if cards == "past_end":
+                log(f"[第{week:02d}周] 已超过最后可用周，结束自动流程")
+                break
+            if cards == "skip":
+                log(
+                    f"[第{week:02d}周] 无法确认已切换到指定周，自动流程停止；"
+                    "请检查周按钮并重新开始，避免继续处理当前显示的其他周次"
+                )
+                _run_on_main(
+                    _show_toast,
+                    f"第{week}周未能选中，自动任务已停止",
+                    '#f38ba8',
+                    3000,
+                )
+                return
+            if cards is None:
+                log(f"[第{week:02d}周] 无法读取课程列表，自动流程中止")
+                return
+            if cards:
+                lessons = [(card["lesson"], card) for card in cards]
+                if week == 1 and lessons:
+                    start_index = _second_meeting_start_index(cards)
+                    if start_index > 0:
+                        skipped_count = min(start_index, len(lessons) - 1)
+                        lessons = lessons[skipped_count:]
+                        log(
+                            f"[第01周] 按设置跳过第一次上课的 {skipped_count} 条录播，"
+                            f"从第二次上课开始（{lessons[0][1].get('date') or '日期未识别'} "
+                            f"{lessons[0][1].get('time') or '时间未识别'}）"
+                        )
+                        _run_on_main(_show_toast, "第1周从第二次上课开始", '#89b4fa', 2200)
+            else:
+                log(f"[第{week:02d}周] 未读出时间，使用原有两节课兼容方案")
+                lessons = [(lesson, None) for lesson in SIMPLE_LESSONS]
+            log(f"[第{week:02d}周] 将按时间顺序处理 {len(lessons)} 节课程")
+            dialog_ready = True
+            for lesson, card in lessons:
                 with _lock:
                     if not state["playing"] or not state["playing_all"]:
                         return
                 if skip_completed and (week, lesson) in completed_lessons:
                     log(f"[第{week:02d}周_第{lesson}节] 已有输出，跳过")
                     continue
-                result = _run_simple_course(week, lesson, region, duration)
+                result = _run_simple_course(
+                    week,
+                    lesson,
+                    region,
+                    duration,
+                    card_hint=card,
+                    dialog_ready=dialog_ready,
+                    week_selected_hint=True,
+                    use_card_duration=use_card_duration,
+                )
+                dialog_ready = False
                 if result is False:
                     log("[简单模式] 自动流程中止")
                     return
+            if dialog_ready:
+                # 本周课程全部被“跳过已有”过滤：不要把弹窗关掉再重开。
+                # 关闭→重开会撞上“关闭动画中标题仍在”的窗口，下一周容易误判
+                # 弹窗仍打开而跳过点击；直接保留弹窗给下一周复用最稳。
+                log(f"[第{week:02d}周] 课程全部跳过，保留切换节次弹窗供下一周复用")
+        if _switch_dialog_open() and _switch_dialog_have_week_tabs():
+            _close_switch_dialog("[简单模式] 收尾")
         log("[简单模式] 自动流程完成")
     finally:
         _stop_monitoring()
@@ -1836,13 +3225,24 @@ def stop_play():
             log("正在停止执行...")
 
 # ====================== 监测循环 ======================
-def monitoring_loop(region):
+def monitoring_loop(region, generation=None):
     x, y, w, h = region
     det = ChangeDetector()
     dedup = ImageDedup()
     cd = 0
     cnt = 0
     start = time.time()
+    route_records = []
+    route_lock = threading.Lock()
+    classification_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="slide-router")
+    classification_futures = []
+    next_interval = CHECK_INTERVAL
+    last_heartbeat = 0.0
+    black_started = None
+    last_black_warning = 0.0
+    last_change = time.time()
+    last_freeze_warning = 0.0
+    last_capture_warning = 0.0
 
     with _lock:
         out_dir = state.get("session_dir") or OUTPUT_DIR
@@ -1850,9 +3250,51 @@ def monitoring_loop(region):
         hwnd = state["target_hwnd"]
         use_window = hwnd is not None and is_window_visible(hwnd)
 
+    # 最小化的窗口不会被 Windows 合成，只能拿到静止的最后一帧。先尝试还原，
+    # 否则无人值守时会出现“每节课只有一两张图”的静默失败。
+    if use_window and _user32.IsIconic(hwnd):
+        log("⚠ 锁定窗口处于最小化状态，无法采集翻页；已自动还原窗口")
+        _user32.ShowWindow(hwnd, SW_RESTORE)
+        time.sleep(0.6)
+
     mode_str = "窗口捕获" if use_window else "屏幕截取"
     log(f"监测中 ({w}x{h}) @ ({x},{y}) [{mode_str}]")
     log(f"输出目录: {out_dir}")
+
+    def classify_and_rename(sequence, pending_path, timestamp, reason, change_score):
+        image = cv2.imdecode(np.fromfile(pending_path, dtype=np.uint8), cv2.IMREAD_COLOR)
+        if image is None:
+            return None
+        decision = _classify_slide(image)
+        category = "OCR" if decision.route == "ocr" else "多模态"
+        final_name = f"slide_{sequence:03d}_{category}_{timestamp}.png"
+        category_dir = os.path.join(out_dir, category)
+        os.makedirs(category_dir, exist_ok=True)
+        final_path = os.path.join(category_dir, final_name)
+        try:
+            os.replace(pending_path, final_path)
+        except OSError:
+            final_name = os.path.basename(pending_path)
+            relative_name = final_name
+        else:
+            relative_name = os.path.join(category, final_name).replace("\\", "/")
+        record = {
+            "sequence": sequence,
+            "file": relative_name,
+            "route": decision.route,
+            "category": category,
+            "confidence": round(decision.confidence, 4),
+            "reason": decision.reason,
+            "model": _vision_router.VERSION,
+            "features": {key: round(value, 4) for key, value in decision.features.items()},
+        }
+        with route_lock:
+            route_records.append(record)
+        if change_score:
+            log(f"[{sequence:03d}] {reason} ({change_score:.0f}%) -> {final_name}")
+        else:
+            log(f"[{sequence:03d}] {reason} -> {final_name}")
+        return final_name
 
     def save_slide(frame, reason, score=0):
         nonlocal cnt, cd
@@ -1863,12 +3305,21 @@ def monitoring_loop(region):
             return False
         cnt += 1
         ts = datetime.now().strftime("%H%M%S")
-        fn = f"slide_{cnt:03d}_{ts}.png"
-        cv2_imwrite(os.path.join(out_dir, fn), frame)
-        if score:
-            log(f"[{cnt:03d}] {reason} ({score:.0f}%) -> {fn}")
-        else:
-            log(f"[{cnt:03d}] {reason} -> {fn}")
+        pending_name = f"slide_{cnt:03d}_待分类_{ts}.png"
+        pending_path = os.path.join(out_dir, pending_name)
+        if not cv2_imwrite(pending_path, frame):
+            log(f"[{cnt:03d}] 图片保存失败: {pending_name}")
+            return False
+        classification_futures.append(
+            classification_executor.submit(
+                classify_and_rename,
+                cnt,
+                pending_path,
+                ts,
+                reason,
+                score,
+            )
+        )
         cd = 3
         return True
 
@@ -1898,23 +3349,44 @@ def monitoring_loop(region):
 
     while True:
         with _lock:
-            if not state["running"] or not state["monitoring"]:
+            if (
+                not state["running"]
+                or not state["monitoring"]
+                or (generation is not None and generation != state.get("monitor_generation"))
+            ):
                 break
             hwnd = state["target_hwnd"]
             use_window = hwnd is not None and is_window_visible(hwnd)
+            capture_paused = bool(state.get("capture_paused"))
+
+        if capture_paused:
+            time.sleep(0.12)
+            continue
 
         try:
             if use_window:
                 img = capture_window(hwnd)
                 if img is None:
-                    # 窗口可能最小化了，等下次循环
-                    time.sleep(CHECK_INTERVAL)
+                    # 窗口最小化/未渲染时拿不到画面。
+                    now = time.time()
+                    if now - last_capture_warning >= 30:
+                        last_capture_warning = now
+                        if _user32.IsIconic(hwnd):
+                            log("⚠ 窗口已最小化，无法捕获画面；请还原窗口后继续监测")
+                        else:
+                            log("窗口捕获暂时无画面（可能被遮挡或正在重绘），等待...")
+                    time.sleep(next_interval)
                     continue
                 frame = img[y:y+h, x:x+w]
                 if _is_black_frame(frame):
-                    # 黑屏，capture_window 已重试过，跳过这帧等下次
-                    time.sleep(CHECK_INTERVAL)
+                    now = time.time()
+                    black_started = black_started or now
+                    if now - black_started >= 2 and now - last_black_warning >= 30:
+                        log("窗口画面持续变黑：已暂停保存；请检查后台捕获是否可用，遮挡时兼容截图可能失效")
+                        last_black_warning = now
+                    time.sleep(next_interval)
                     continue
+                black_started = None
             else:
                 frame = None
                 for _ in range(MIN_VALID_CAPTURE_RETRIES):
@@ -1925,7 +3397,7 @@ def monitoring_loop(region):
                         break
                     time.sleep(0.05)
                 if frame is None:
-                    time.sleep(CHECK_INTERVAL)
+                    time.sleep(next_interval)
                     continue
         except Exception as e:
             log(f"截图失败: {e}")
@@ -1937,10 +3409,28 @@ def monitoring_loop(region):
             det.reset()
 
         changed, score, status = det.detect(frame)
+        next_interval = 0.35 if status in ("transitioning", "fast_switch") else CHECK_INTERVAL
+
+        now = time.time()
+        if score > 0.5:
+            last_change = now
+        elif now - last_change >= FREEZE_WARN_SECONDS and now - last_freeze_warning >= FREEZE_WARN_SECONDS:
+            last_freeze_warning = now
+            state_hint = "窗口已最小化" if _user32.IsIconic(hwnd) else "窗口可见但画面未变化"
+            log(
+                f"⚠ 画面已 {int(now - last_change)}s 无任何变化（{state_hint}）："
+                "播放可能暂停/缓冲，或窗口未在渲染；已重置窗口捕获重试"
+            )
+            # 重启 WGC 会话，排除捕获会话失效导致的假冻结。
+            try:
+                _graphics_capture.stop()
+            except Exception:
+                pass
 
         elapsed = time.time() - start
-        if int(elapsed) % 30 == 0 and int(elapsed) > 0 and int((elapsed - 0.5)) % 30 != 0:
+        if _config.get("heartbeat_log", False) and elapsed - last_heartbeat >= 30.0:
             log(f"[心跳] 运行中 {cnt}张 | 状态={status} | 差异={score:.1f}%")
+            last_heartbeat = elapsed
 
         if cd > 0:
             cd -= 1
@@ -1948,12 +3438,26 @@ def monitoring_loop(region):
         if changed and cd == 0:
             save_slide(frame, "翻页", score)
 
-        time.sleep(CHECK_INTERVAL)
+        time.sleep(next_interval)
 
     elapsed = time.time() - start
     log(f"监测结束 | {elapsed:.0f}s | {cnt}张 | 目录: {os.path.basename(out_dir)}/")
+    for future in classification_futures:
+        try:
+            future.result()
+        except Exception as e:
+            log(f"后台分类失败: {e}")
+    classification_executor.shutdown(wait=True)
+    route_records.sort(key=lambda item: item.get("sequence", 0))
+    if route_records:
+        try:
+            with open(os.path.join(out_dir, "recognition_routes.json"), "w", encoding="utf-8") as f:
+                json.dump(route_records, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            log(f"识别路由清单保存失败: {e}")
     if cnt > 0:
-        _export_session_pdf(out_dir, session_label)
+        # PDF 合成与监测线程解耦，避免停止/切课时出现明显卡顿。
+        threading.Thread(target=_export_session_pdf, args=(out_dir, session_label), daemon=True).start()
     # 清理空目录
     try:
         if os.path.isdir(out_dir) and not os.listdir(out_dir):
@@ -1962,7 +3466,8 @@ def monitoring_loop(region):
     except Exception:
         pass
     with _lock:
-        state["monitoring"] = False
+        if generation is None or generation == state.get("monitor_generation"):
+            state["monitoring"] = False
 
 # ====================== 可视化反馈 ======================
 _sel_window = None
@@ -2117,6 +3622,7 @@ def on_mouse_click(x, y, button, pressed):
             state["target_hwnd"] = hwnd
             state["window_picking"] = False
             state["window_title"] = title
+            state["course_name"] = ""
             # 如果之前有选区，转为窗口相对坐标
             if state["region"]:
                 rect = wintypes.RECT()
@@ -2371,11 +3877,13 @@ def start_keyboard():
                 with _lock:
                     state["target_hwnd"] = None
                     state["window_title"] = ""
+                    state["course_name"] = ""
                     if state["region"] and is_window_visible(hwnd):
                         rect = wintypes.RECT()
                         _user32.GetWindowRect(hwnd, ctypes.byref(rect))
                         rx, ry, rw, rh = state["region"]
                         state["region"] = (rx + rect.left, ry + rect.top, rw, rh)
+                _graphics_capture.stop()
                 log("已解锁窗口，切换回屏幕截取模式")
                 _run_on_main(_show_toast, "已解锁窗口", '#fab387')
             else:
@@ -2711,7 +4219,7 @@ def create_gui():
         with _lock:
             h = state["target_hwnd"]
             if h:
-                state["target_hwnd"] = None; state["window_title"] = ""
+                state["target_hwnd"] = None; state["window_title"] = ""; state["course_name"] = ""
                 if state["region"] and is_window_visible(h):
                     rect = wintypes.RECT(); _user32.GetWindowRect(h, ctypes.byref(rect))
                     rx, ry, rw, rh = state["region"]; state["region"] = (rx+rect.left, ry+rect.top, rw, rh)
@@ -3160,10 +4668,943 @@ def create_gui():
         log("退出中...")
         with _lock:
             state["running"] = False
+        _graphics_capture.stop()
         root.destroy()
         os._exit(0)
 
     root.protocol("WM_DELETE_WINDOW", on_close)
+    return root
+
+def create_gui_v8():
+    """简化后的双模式界面：常用操作始终可见，自动参数按需显示。"""
+    root = tk.Tk()
+    root.title("课件捕获助手")
+    root.geometry("1040x760")
+    root.minsize(920, 700)
+    root.configure(bg="#0b1220")
+    _set_gui_root(root)
+
+    colors = {
+        "bg": "#0b1220",
+        "panel": "#111b2e",
+        "panel2": "#16233b",
+        "text": "#edf4ff",
+        "muted": "#91a4c3",
+        "blue": "#4f8cff",
+        "blue_hover": "#6ba0ff",
+        "green": "#2ed39a",
+        "green_hover": "#55e2b2",
+        "red": "#ff657a",
+        "red_hover": "#ff8293",
+        "amber": "#ffbf69",
+        "border": "#263754",
+        "entry": "#0d1728",
+    }
+
+    style = ttk.Style(root)
+    try:
+        style.theme_use("clam")
+    except tk.TclError:
+        pass
+    style.configure(
+        "Dark.TCombobox",
+        fieldbackground=colors["entry"],
+        background=colors["panel2"],
+        foreground=colors["text"],
+        arrowcolor=colors["text"],
+        bordercolor=colors["border"],
+        lightcolor=colors["border"],
+        darkcolor=colors["border"],
+    )
+
+    def button(parent, text, command, kind="secondary", font_size=11, **pack_options):
+        palettes = {
+            "primary": (colors["blue"], colors["blue_hover"], "#ffffff"),
+            "success": (colors["green"], colors["green_hover"], "#071712"),
+            "danger": (colors["red"], colors["red_hover"], "#ffffff"),
+            "secondary": (colors["panel2"], colors["border"], colors["text"]),
+        }
+        bg, hover, fg = palettes[kind]
+        widget = tk.Button(
+            parent,
+            text=text,
+            command=command,
+            bg=bg,
+            fg=fg,
+            activebackground=hover,
+            activeforeground=fg,
+            relief="flat",
+            bd=0,
+            padx=16,
+            pady=10,
+            cursor="hand2",
+            font=("Microsoft YaHei UI", font_size, "bold"),
+        )
+        widget.pack(**pack_options)
+        return widget
+
+    def panel(parent, **pack_options):
+        widget = tk.Frame(
+            parent,
+            bg=colors["panel"],
+            highlightbackground=colors["border"],
+            highlightthickness=1,
+            padx=18,
+            pady=16,
+        )
+        widget.pack(**pack_options)
+        return widget
+
+    def label(parent, text="", variable=None, muted=False, size=10, bold=False, **pack_options):
+        widget = tk.Label(
+            parent,
+            text=text,
+            textvariable=variable,
+            bg=parent.cget("bg"),
+            fg=colors["muted"] if muted else colors["text"],
+            font=("Microsoft YaHei UI", size, "bold" if bold else "normal"),
+            anchor="w",
+            justify="left",
+        )
+        widget.pack(**pack_options)
+        return widget
+
+    def entry(parent, variable, width=12):
+        return tk.Entry(
+            parent,
+            textvariable=variable,
+            width=width,
+            bg=colors["entry"],
+            fg=colors["text"],
+            insertbackground=colors["text"],
+            selectbackground=colors["blue"],
+            relief="flat",
+            highlightthickness=1,
+            highlightbackground=colors["border"],
+            highlightcolor=colors["blue"],
+            font=("Microsoft YaHei UI", 11),
+        )
+
+    mode_var = tk.StringVar(value=str(_config.get("ui_mode", "auto")))
+    status_var = tk.StringVar(value="准备就绪")
+    setup_var = tk.StringVar(value="等待锁定窗口和框选范围")
+    output_var = tk.StringVar(value=OUTPUT_DIR)
+    route_var = tk.StringVar(value=f"图片路由模型：{_vision_router.VERSION} · 自动判断 OCR / 多模态")
+    weeks_var = tk.StringVar(value=str(_config.get("simple_weeks", DEFAULT_SIMPLE_WEEKS)))
+    duration_var = tk.StringVar(value=str(_config.get("simple_duration_seconds", 1500)))
+    speed_var = tk.StringVar(value=str(_config.get("playback_speed", "auto")))
+    tail_var = tk.StringVar(value=str(_config.get("speed_tail_seconds", 90)))
+    skip_var = tk.BooleanVar(value=bool(_config.get("simple_skip_done", True)))
+    background_var = tk.BooleanVar(value=bool(_config.get("cursor_free_opt_in", False)))
+
+    # Header
+    header = tk.Frame(root, bg=colors["bg"], padx=24, pady=18)
+    header.pack(fill=tk.X)
+    title_box = tk.Frame(header, bg=colors["bg"])
+    title_box.pack(side=tk.LEFT, fill=tk.X, expand=True)
+    label(title_box, "课件捕获助手", size=22, bold=True, fill=tk.X)
+    label(title_box, "后台监测 · 智能认课 · 自动整理", muted=True, size=10, fill=tk.X, pady=(3, 0))
+    status_badge = tk.Label(
+        header,
+        textvariable=status_var,
+        bg=colors["panel2"],
+        fg=colors["green"],
+        padx=14,
+        pady=7,
+        font=("Microsoft YaHei UI", 10, "bold"),
+    )
+    status_badge.pack(side=tk.RIGHT)
+
+    body = tk.Frame(root, bg=colors["bg"], padx=24)
+    body.pack(fill=tk.BOTH, expand=True)
+
+    # Mode switch
+    switch_bar = tk.Frame(body, bg=colors["panel"], padx=6, pady=6)
+    switch_bar.pack(fill=tk.X, pady=(0, 12))
+    auto_mode_button = tk.Button(switch_bar, text="自动模式", relief="flat", bd=0, cursor="hand2", font=("Microsoft YaHei UI", 11, "bold"), padx=26, pady=8)
+    manual_mode_button = tk.Button(switch_bar, text="手动模式", relief="flat", bd=0, cursor="hand2", font=("Microsoft YaHei UI", 11, "bold"), padx=26, pady=8)
+    auto_mode_button.pack(side=tk.LEFT)
+    manual_mode_button.pack(side=tk.LEFT, padx=(6, 0))
+    label(switch_bar, "自动：依次寻找课程并捕获；手动：只监测当前画面", muted=True, size=10, side=tk.RIGHT, padx=10)
+
+    # Essential setup is deliberately prominent in both modes.
+    setup = panel(body, fill=tk.X, pady=(0, 12))
+    setup_head = tk.Frame(setup, bg=colors["panel"])
+    setup_head.pack(fill=tk.X, pady=(0, 12))
+    label(setup_head, "开始前的 3 项设置", size=14, bold=True, side=tk.LEFT)
+    label(setup_head, "快捷键：Alt+I 锁定 · Alt+Q 框选", muted=True, side=tk.RIGHT)
+
+    setup_buttons = tk.Frame(setup, bg=colors["panel"])
+    setup_buttons.pack(fill=tk.X)
+
+    def pick_window():
+        with _lock:
+            if state["monitoring"] or state["playing"]:
+                _show_toast("运行中不能更换窗口", colors["red"], 1600)
+                return
+            state["window_picking"] = True
+        log("选取窗口: 点击智慧课堂窗口")
+        _show_toast("请点击智慧课堂窗口", colors["blue"], 1800)
+
+    def unlock_window():
+        with _lock:
+            hwnd = state.get("target_hwnd")
+            if not hwnd:
+                return
+            if state.get("region") and is_window_visible(hwnd):
+                rect = wintypes.RECT()
+                _user32.GetWindowRect(hwnd, ctypes.byref(rect))
+                rx, ry, rw, rh = state["region"]
+                state["region"] = (rx + rect.left, ry + rect.top, rw, rh)
+            state["target_hwnd"] = None
+            state["window_title"] = ""
+            state["course_name"] = ""
+        _graphics_capture.stop()
+        log("已解除窗口锁定")
+
+    def toggle_window():
+        with _lock:
+            locked = bool(state.get("target_hwnd") and is_window_visible(state.get("target_hwnd")))
+        unlock_window() if locked else pick_window()
+
+    def pick_region():
+        with _lock:
+            if state["monitoring"] or state["playing"]:
+                _show_toast("请先停止当前任务", colors["red"], 1600)
+                return
+            state["picking"] = True
+            state["pick_step"] = 1
+            state["pick_p1"] = None
+        log("框选范围: 按住左键拖出 PPT 区域")
+        _show_toast("按住左键拖出 PPT 播放区域", colors["blue"], 2000)
+
+    window_button = button(setup_buttons, "① 锁定智慧课堂窗口", toggle_window, "primary", 12, side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
+    region_button = button(setup_buttons, "② 框选 PPT 范围", pick_region, "primary", 12, side=tk.LEFT, fill=tk.X, expand=True, padx=6)
+
+    def choose_output():
+        with _lock:
+            busy = state["monitoring"] or state["playing"]
+        if busy:
+            _show_toast("请停止任务后再更换目录", colors["red"], 1800)
+            return
+        chosen = filedialog.askdirectory(parent=root, title="选择图片和 PDF 的保存目录", initialdir=OUTPUT_DIR)
+        if not chosen:
+            return
+        try:
+            target = _set_output_dir(chosen)
+            output_var.set(target)
+            log(f"输出目录已切换: {target}")
+            _show_toast("输出目录已保存", colors["green"], 1400)
+        except Exception as exc:
+            log(f"输出目录切换失败: {exc}")
+            _show_toast(f"目录不可用: {exc}", colors["red"], 2200)
+
+    output_button = button(setup_buttons, "③ 设置输出目录", choose_output, "secondary", 12, side=tk.LEFT, fill=tk.X, expand=True, padx=(6, 0))
+    label(setup, variable=setup_var, muted=True, size=10, fill=tk.X, pady=(10, 0))
+
+    path_row = tk.Frame(setup, bg=colors["entry"], padx=10, pady=7)
+    path_row.pack(fill=tk.X, pady=(10, 0))
+    label(path_row, "保存到", muted=True, side=tk.LEFT, padx=(0, 10))
+    label(path_row, variable=output_var, size=9, side=tk.LEFT, fill=tk.X, expand=True)
+
+    mode_area = tk.Frame(body, bg=colors["bg"])
+    mode_area.pack(fill=tk.BOTH, expand=True)
+    auto_panel = panel(mode_area, fill=tk.BOTH, expand=True)
+    manual_panel = panel(mode_area, fill=tk.BOTH, expand=True)
+
+    # Automatic options
+    label(auto_panel, "自动认课设置", size=14, bold=True, fill=tk.X)
+    label(auto_panel, "程序会先读取本周所有卡片时间，再按时间先后处理；超过 2 节也无需手动排序。", muted=True, fill=tk.X, pady=(3, 14))
+    grid = tk.Frame(auto_panel, bg=colors["panel"])
+    grid.pack(fill=tk.X)
+    for column in range(4):
+        grid.grid_columnconfigure(column, weight=1)
+
+    def field(column, title, variable, hint="", width=13):
+        box = tk.Frame(grid, bg=colors["panel"])
+        box.grid(row=0, column=column, sticky="ew", padx=(0 if column == 0 else 8, 0), pady=(0, 12))
+        label(box, title, muted=True, size=9, fill=tk.X, pady=(0, 5))
+        widget = entry(box, variable, width)
+        widget.pack(fill=tk.X, ipady=7)
+        if hint:
+            label(box, hint, muted=True, size=8, fill=tk.X, pady=(4, 0))
+        return widget
+
+    field(0, "周范围", weeks_var, "例：1-8,10,12-16")
+    field(1, "每节课程时长（秒）", duration_var, "用于判断何时切下一节")
+    speed_box = tk.Frame(grid, bg=colors["panel"])
+    speed_box.grid(row=0, column=2, sticky="ew", padx=(8, 0), pady=(0, 12))
+    label(speed_box, "播放倍速", muted=True, size=9, fill=tk.X, pady=(0, 5))
+    speed_combo = ttk.Combobox(speed_box, textvariable=speed_var, values=("auto", "1.0x", "1.25x", "1.5x", "2.0x"), state="readonly", style="Dark.TCombobox")
+    speed_combo.pack(fill=tk.X, ipady=7)
+    label(speed_box, "auto 会按课程长度选择", muted=True, size=8, fill=tk.X, pady=(4, 0))
+    field(3, "末尾恢复 1×（秒）", tail_var, "防止错过最后几页")
+
+    checks = tk.Frame(auto_panel, bg=colors["panel"])
+    checks.pack(fill=tk.X, pady=(2, 8))
+
+    def save_auto_preferences():
+        _config["simple_weeks"] = weeks_var.get().strip() or DEFAULT_SIMPLE_WEEKS
+        _config["playback_speed"] = speed_var.get()
+        _config["simple_skip_done"] = bool(skip_var.get())
+        _config["interaction_mode"] = "uia" if background_var.get() else "foreground"
+        _config["cursor_free_opt_in"] = bool(background_var.get())
+        try:
+            _config["speed_tail_seconds"] = max(0.0, float(tail_var.get()))
+        except ValueError:
+            _config["speed_tail_seconds"] = 90
+            tail_var.set("90")
+        save_config(_config)
+
+    for text_value, variable in (("跳过已有结果", skip_var), ("无鼠标控制（UIA）", background_var)):
+        tk.Checkbutton(
+            checks,
+            text=text_value,
+            variable=variable,
+            command=save_auto_preferences,
+            bg=colors["panel"],
+            fg=colors["text"],
+            activebackground=colors["panel"],
+            activeforeground=colors["text"],
+            selectcolor=colors["entry"],
+            font=("Microsoft YaHei UI", 10),
+        ).pack(side=tk.LEFT, padx=(0, 22))
+    label(auto_panel, variable=route_var, muted=True, size=9, fill=tk.X, pady=(2, 0))
+
+    # Manual panel has no automatic-only settings.
+    label(manual_panel, "手动监测", size=14, bold=True, fill=tk.X)
+    label(manual_panel, "适合已经打开目标课程的情况。开始后只检测 PPT 翻页并保存，不查找或切换课程。", muted=True, fill=tk.X, pady=(4, 16))
+    manual_info = tk.Frame(manual_panel, bg=colors["panel2"], padx=14, pady=12)
+    manual_info.pack(fill=tk.X)
+    label(manual_info, "提示：检测过程使用低分辨率差异计算，保存的图片仍是原始清晰度。", size=10, fill=tk.X)
+
+    # Main action bar
+    actions = tk.Frame(root, bg=colors["panel"], padx=24, pady=16, highlightbackground=colors["border"], highlightthickness=1)
+    actions.pack(fill=tk.X, side=tk.BOTTOM)
+    action_hint_var = tk.StringVar(value="")
+    hint_box = tk.Frame(actions, bg=colors["panel"])
+    hint_box.pack(side=tk.LEFT, fill=tk.X, expand=True)
+    label(hint_box, variable=action_hint_var, size=11, bold=True, fill=tk.X)
+    label(hint_box, "停止按钮会同时终止自动切课与画面监测", muted=True, size=9, fill=tk.X, pady=(3, 0))
+
+    def prerequisites():
+        with _lock:
+            hwnd = state.get("target_hwnd")
+            region = state.get("region")
+        if not hwnd or not is_window_visible(hwnd):
+            return False, "请先锁定智慧课堂窗口"
+        if not region or region[2] < 10 or region[3] < 10:
+            return False, "请先框选 PPT 播放范围"
+        return True, ""
+
+    def start_manual():
+        ok, message = prerequisites()
+        if not ok:
+            _show_toast(message, colors["red"], 1800)
+            return
+        with _lock:
+            if state["monitoring"] or state["playing"]:
+                _show_toast("任务已经在运行", colors["amber"], 1400)
+                return
+            region = state["region"]
+        _start_monitoring(region, "手动")
+        _show_toast("手动监测已开始", colors["green"], 1500)
+
+    def start_auto():
+        ok, message = prerequisites()
+        if not ok:
+            _show_toast(message, colors["red"], 1800)
+            return
+        weeks = _parse_week_spec(weeks_var.get())
+        if not weeks:
+            _show_toast("周范围格式不正确", colors["red"], 1800)
+            return
+        try:
+            duration = max(60.0, float(duration_var.get()))
+        except ValueError:
+            _show_toast("课程时长需要填写数字", colors["red"], 1800)
+            return
+        ocr_ok, ocr_message = _ocr_ready()
+        if not ocr_ok:
+            _show_toast(ocr_message, colors["red"], 2200)
+            return
+        save_auto_preferences()
+        _config["simple_duration_seconds"] = duration
+        save_config(_config)
+        threading.Thread(target=run_simple_auto_courses, args=(weeks, duration, skip_var.get()), daemon=True).start()
+
+    def start_selected_mode():
+        start_auto() if mode_var.get() == "auto" else start_manual()
+
+    def stop_everything():
+        stop_play()
+        _stop_monitoring()
+        _show_toast("已停止", colors["amber"], 1200)
+
+    def manual_snapshot():
+        manual_capture()
+        _show_toast("已保存当前画面", colors["green"], 1000)
+
+    snapshot_button = button(actions, "保存当前页", manual_snapshot, "secondary", 11, side=tk.RIGHT, padx=(8, 0))
+    stop_button = button(actions, "■  停止", stop_everything, "danger", 12, side=tk.RIGHT, padx=(8, 0))
+    start_button = button(actions, "▶  开始自动处理", start_selected_mode, "success", 13, side=tk.RIGHT, padx=(16, 0))
+
+    def switch_mode(mode):
+        mode_var.set(mode)
+        _config["ui_mode"] = mode
+        save_config(_config)
+        if mode == "auto":
+            manual_panel.pack_forget()
+            auto_panel.pack(fill=tk.BOTH, expand=True)
+            auto_mode_button.configure(bg=colors["blue"], fg="#ffffff", activebackground=colors["blue_hover"], activeforeground="#ffffff")
+            manual_mode_button.configure(bg=colors["panel"], fg=colors["muted"], activebackground=colors["panel2"], activeforeground=colors["text"])
+            start_button.configure(text="▶  开始自动处理")
+            action_hint_var.set("自动寻找课程、调整倍速并捕获每一页")
+        else:
+            auto_panel.pack_forget()
+            manual_panel.pack(fill=tk.BOTH, expand=True)
+            manual_mode_button.configure(bg=colors["blue"], fg="#ffffff", activebackground=colors["blue_hover"], activeforeground="#ffffff")
+            auto_mode_button.configure(bg=colors["panel"], fg=colors["muted"], activebackground=colors["panel2"], activeforeground=colors["text"])
+            start_button.configure(text="▶  开始检测")
+            action_hint_var.set("监测当前课程，翻页时自动保存")
+
+    auto_mode_button.configure(command=lambda: switch_mode("auto"))
+    manual_mode_button.configure(command=lambda: switch_mode("manual"))
+    switch_mode(mode_var.get() if mode_var.get() in ("auto", "manual") else "auto")
+
+    def update_ui():
+        with _lock:
+            monitoring = state["monitoring"]
+            playing = state["playing"]
+            hwnd = state.get("target_hwnd")
+            title = state.get("window_title", "")
+            region = state.get("region")
+            picking_window = state.get("window_picking")
+            background_clicks = state.get("background_clicks", 0)
+        locked = bool(hwnd and is_window_visible(hwnd))
+        if playing:
+            status_var.set("自动处理中")
+            status_badge.configure(fg=colors["green"])
+        elif monitoring:
+            status_var.set("正在检测翻页")
+            status_badge.configure(fg=colors["green"])
+        elif picking_window:
+            status_var.set("请点击目标窗口")
+            status_badge.configure(fg=colors["amber"])
+        else:
+            status_var.set("准备就绪")
+            status_badge.configure(fg=colors["muted"])
+        window_button.configure(text="✓ 已锁定窗口" if locked else "① 锁定智慧课堂窗口")
+        region_button.configure(text=f"✓ 已框选 {region[2]}×{region[3]}" if region else "② 框选 PPT 范围")
+        window_text = f"窗口：{title[:36]}" if locked else "窗口：未锁定"
+        region_text = f"范围：{region[2]}×{region[3]}" if region else "范围：未框选"
+        setup_var.set(f"{window_text}   ·   {region_text}   ·   后台点击 {background_clicks} 次")
+        root.after(350, update_ui)
+
+    def on_close():
+        with _lock:
+            state["running"] = False
+            state["monitoring"] = False
+            state["playing"] = False
+            state["playing_all"] = False
+        _graphics_capture.stop()
+        root.destroy()
+
+    root.protocol("WM_DELETE_WINDOW", on_close)
+    update_ui()
+    return root
+
+def create_gui_v9():
+    """清爽的浅色工作台界面。"""
+    root = tk.Tk()
+    root.title("课件捕获助手")
+    root.geometry("1100x740")
+    root.minsize(1020, 700)
+    root.configure(bg="#F4F6FA")
+    _set_gui_root(root)
+
+    C = {
+        "nav": "#E9EEEB",
+        "nav_soft": "#DDE6E1",
+        "nav_text": "#35453F",
+        "nav_muted": "#7C8C86",
+        "bg": "#F6F4F0",
+        "card": "#FFFEFC",
+        "text": "#37423E",
+        "muted": "#7D8984",
+        "line": "#E5E1D9",
+        "input": "#F7F5F1",
+        "primary": "#7FA89B",
+        "primary_hover": "#71998C",
+        "mint": "#83B6A5",
+        "mint_soft": "#EDF4F0",
+        "danger": "#C9878E",
+        "danger_soft": "#F8ECEC",
+        "amber": "#C5A273",
+    }
+
+    class SoftButton(tk.Canvas):
+        def __init__(self, parent, text, command, width=180, height=44, bg="#536DFE", fg="#FFFFFF", hover=None, radius=13, font_size=10):
+            super().__init__(parent, width=width, height=height, bg=parent.cget("bg"), highlightthickness=0, bd=0, cursor="hand2")
+            self.command = command
+            self.normal = bg
+            self.hover = hover or bg
+            self.fg = fg
+            self.radius = radius
+            self.font_size = font_size
+            self._text = text
+            self.bind("<Button-1>", lambda _event: self.command())
+            self.bind("<Enter>", lambda _event: self.draw(self.hover))
+            self.bind("<Leave>", lambda _event: self.draw(self.normal))
+            self.draw(self.normal)
+
+        def rounded(self, x1, y1, x2, y2, radius, **kwargs):
+            points = [
+                x1 + radius, y1, x2 - radius, y1, x2, y1, x2, y1 + radius,
+                x2, y2 - radius, x2, y2, x2 - radius, y2, x1 + radius, y2,
+                x1, y2, x1, y2 - radius, x1, y1 + radius, x1, y1,
+            ]
+            return self.create_polygon(points, smooth=True, splinesteps=24, **kwargs)
+
+        def draw(self, fill=None):
+            self.delete("all")
+            self.rounded(2, 2, int(self.cget("width")) - 2, int(self.cget("height")) - 2, self.radius, fill=fill or self.normal, outline="")
+            self.create_text(int(self.cget("width")) // 2, int(self.cget("height")) // 2, text=self._text, fill=self.fg, font=("Microsoft YaHei UI", self.font_size, "bold"))
+
+        def set_text(self, text):
+            self._text = text
+            self.draw(self.normal)
+
+        def set_palette(self, bg, fg, hover=None):
+            self.normal, self.fg, self.hover = bg, fg, hover or bg
+            self.draw(self.normal)
+
+    def text(parent, value="", variable=None, color=None, size=10, bold=False, **pack):
+        widget = tk.Label(
+            parent,
+            text=value,
+            textvariable=variable,
+            bg=parent.cget("bg"),
+            fg=color or C["text"],
+            font=("Microsoft YaHei UI", size, "bold" if bold else "normal"),
+            anchor="w",
+            justify="left",
+        )
+        widget.pack(**pack)
+        return widget
+
+    def card(parent, **pack):
+        widget = tk.Frame(parent, bg=C["card"], highlightbackground=C["line"], highlightthickness=1, padx=20, pady=18)
+        widget.pack(**pack)
+        return widget
+
+    def input_box(parent, variable, width=12):
+        return tk.Entry(
+            parent,
+            textvariable=variable,
+            width=width,
+            relief="flat",
+            bd=0,
+            bg=C["input"],
+            fg=C["text"],
+            insertbackground=C["text"],
+            highlightthickness=1,
+            highlightbackground=C["line"],
+            highlightcolor=C["primary"],
+            font=("Microsoft YaHei UI", 11),
+        )
+
+    mode_var = tk.StringVar(value=str(_config.get("ui_mode", "auto")))
+    status_var = tk.StringVar(value="待机")
+    page_title_var = tk.StringVar(value="自动处理")
+    page_subtitle_var = tk.StringVar(value="设置课程范围，程序会按时间顺序完成每一节课")
+    window_value_var = tk.StringVar(value="尚未锁定")
+    region_value_var = tk.StringVar(value="尚未框选")
+    output_value_var = tk.StringVar(value=OUTPUT_DIR)
+    weeks_var = tk.StringVar(value=str(_config.get("simple_weeks", DEFAULT_SIMPLE_WEEKS)))
+    duration_var = tk.StringVar(value=str(_config.get("simple_duration_seconds", 1500)))
+    speed_var = tk.StringVar(value=str(_config.get("playback_speed", "auto")))
+    tail_var = tk.StringVar(value=str(_config.get("speed_tail_seconds", 90)))
+    skip_var = tk.BooleanVar(value=bool(_config.get("simple_skip_done", True)))
+    background_var = tk.BooleanVar(value=bool(_config.get("cursor_free_opt_in", False)))
+    card_duration_var = tk.BooleanVar(value=bool(_config.get("simple_use_card_duration", True)))
+
+    # Sidebar
+    sidebar = tk.Frame(root, bg=C["nav"], width=242)
+    sidebar.pack(side=tk.LEFT, fill=tk.Y)
+    sidebar.pack_propagate(False)
+    brand = tk.Frame(sidebar, bg=C["nav"], padx=24, pady=25)
+    brand.pack(fill=tk.X)
+    logo = tk.Label(brand, text="P", width=2, height=1, bg="#A7A9C6", fg="#FFFFFF", font=("Segoe UI", 17, "bold"))
+    logo.pack(side=tk.LEFT, padx=(0, 12))
+    brand_copy = tk.Frame(brand, bg=C["nav"])
+    brand_copy.pack(side=tk.LEFT, fill=tk.X)
+    text(brand_copy, "课件捕获", color=C["nav_text"], size=14, bold=True, fill=tk.X)
+    text(brand_copy, "PPT CAPTURE", color=C["nav_muted"], size=8, fill=tk.X, pady=(2, 0))
+
+    text(sidebar, "工作模式", color=C["nav_muted"], size=9, bold=True, fill=tk.X, padx=24, pady=(16, 8))
+    mode_box = tk.Frame(sidebar, bg=C["nav"], padx=18)
+    mode_box.pack(fill=tk.X)
+    auto_mode_btn = SoftButton(mode_box, "自动处理", lambda: None, width=204, height=48, bg=C["primary"], hover=C["primary_hover"], font_size=11)
+    auto_mode_btn.pack(pady=(0, 8))
+    manual_mode_btn = SoftButton(mode_box, "手动检测", lambda: None, width=204, height=48, bg="#F2F4F1", fg=C["nav_muted"], hover="#E1E8E4", font_size=11)
+    manual_mode_btn.pack()
+
+    text(sidebar, "准备流程", color=C["nav_muted"], size=9, bold=True, fill=tk.X, padx=24, pady=(34, 12))
+    steps_box = tk.Frame(sidebar, bg=C["nav"], padx=24)
+    steps_box.pack(fill=tk.X)
+    step_labels = []
+    for number, title in ((1, "锁定目标窗口"), (2, "框选 PPT 范围"), (3, "确认保存位置")):
+        row = tk.Frame(steps_box, bg=C["nav"], pady=6)
+        row.pack(fill=tk.X)
+        badge = tk.Label(row, text=str(number), width=2, height=1, bg=C["nav_soft"], fg=C["nav_muted"], font=("Segoe UI", 9, "bold"))
+        badge.pack(side=tk.LEFT, padx=(0, 10))
+        label_widget = tk.Label(row, text=title, bg=C["nav"], fg=C["nav_muted"], font=("Microsoft YaHei UI", 10), anchor="w")
+        label_widget.pack(side=tk.LEFT)
+        step_labels.append((badge, label_widget))
+
+    status_box = tk.Frame(sidebar, bg="#F3F5F2", padx=14, pady=12)
+    status_box.pack(side=tk.BOTTOM, fill=tk.X, padx=18, pady=18)
+    status_dot = tk.Label(status_box, text="●", bg="#F3F5F2", fg=C["mint"], font=("Segoe UI", 10))
+    status_dot.pack(side=tk.LEFT, padx=(0, 8))
+    text(status_box, variable=status_var, color=C["nav_text"], size=10, bold=True, side=tk.LEFT)
+
+    # Main workspace
+    main = tk.Frame(root, bg=C["bg"])
+    main.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+    header = tk.Frame(main, bg=C["bg"], padx=32, pady=16)
+    header.pack(fill=tk.X)
+    heading = tk.Frame(header, bg=C["bg"])
+    heading.pack(side=tk.LEFT, fill=tk.X, expand=True)
+    text(heading, variable=page_title_var, size=20, bold=True, fill=tk.X)
+    text(heading, variable=page_subtitle_var, color=C["muted"], size=9, fill=tk.X, pady=(2, 0))
+    model_pill = tk.Label(header, text="  智能识别已启用  ", bg=C["mint_soft"], fg="#668B7F", font=("Microsoft YaHei UI", 9, "bold"), padx=8, pady=6)
+    model_pill.pack(side=tk.RIGHT)
+
+    content = tk.Frame(main, bg=C["bg"], padx=32)
+    content.pack(fill=tk.BOTH, expand=True)
+
+    # Setup card: three calm rows instead of large blocks.
+    setup_card = card(content, fill=tk.X, pady=(0, 14))
+    setup_card.configure(padx=16, pady=12)
+    setup_head = tk.Frame(setup_card, bg=C["card"])
+    setup_head.pack(fill=tk.X, pady=(0, 8))
+    text(setup_head, "开始前", size=13, bold=True, side=tk.LEFT)
+    text(setup_head, "按顺序完成以下设置", color=C["muted"], size=9, side=tk.RIGHT)
+    setup_rows = tk.Frame(setup_card, bg=C["card"])
+    setup_rows.pack(fill=tk.X)
+    setup_rows.grid_columnconfigure(0, weight=1)
+    setup_rows.grid_columnconfigure(1, weight=1)
+    setup_rows.grid_columnconfigure(2, weight=1)
+
+    def setup_cell(column, eyebrow, variable):
+        frame = tk.Frame(setup_rows, bg=C["input"], padx=12, pady=8, highlightbackground=C["line"], highlightthickness=1)
+        frame.grid(row=0, column=column, sticky="nsew", padx=(0 if column == 0 else 6, 0 if column == 2 else 6))
+        text(frame, eyebrow, color=C["muted"], size=8, bold=True, fill=tk.X)
+        text(frame, variable=variable, size=10, bold=True, fill=tk.X, pady=(2, 6))
+        return frame
+
+    window_cell = setup_cell(0, "01  目标窗口", window_value_var)
+    region_cell = setup_cell(1, "02  捕获范围", region_value_var)
+    output_cell = setup_cell(2, "03  保存目录", output_value_var)
+
+    def pick_window():
+        with _lock:
+            if state["monitoring"] or state["playing"]:
+                _show_toast("请先停止当前任务", C["danger"], 1500)
+                return
+            state["window_picking"] = True
+        _show_toast("请点击智慧课堂窗口", C["primary"], 1800)
+        log("选取窗口: 点击智慧课堂窗口")
+
+    def unlock_window():
+        with _lock:
+            hwnd = state.get("target_hwnd")
+            if not hwnd:
+                return
+            if state.get("region") and is_window_visible(hwnd):
+                rect = wintypes.RECT()
+                _user32.GetWindowRect(hwnd, ctypes.byref(rect))
+                rx, ry, rw, rh = state["region"]
+                state["region"] = (rx + rect.left, ry + rect.top, rw, rh)
+            state["target_hwnd"] = None
+            state["window_title"] = ""
+            state["course_name"] = ""
+        _graphics_capture.stop()
+
+    def toggle_window():
+        with _lock:
+            locked = bool(state.get("target_hwnd") and is_window_visible(state.get("target_hwnd")))
+        unlock_window() if locked else pick_window()
+
+    def pick_region():
+        with _lock:
+            if state["monitoring"] or state["playing"]:
+                _show_toast("请先停止当前任务", C["danger"], 1500)
+                return
+            state["picking"] = True
+            state["pick_step"] = 1
+            state["pick_p1"] = None
+        _show_toast("按住左键框选 PPT 播放区域", C["primary"], 1800)
+
+    def choose_output():
+        with _lock:
+            busy = state["monitoring"] or state["playing"]
+        if busy:
+            _show_toast("请停止任务后再更换目录", C["danger"], 1800)
+            return
+        chosen = filedialog.askdirectory(parent=root, title="选择图片和 PDF 的保存目录", initialdir=OUTPUT_DIR)
+        if chosen:
+            try:
+                output_value_var.set(_set_output_dir(chosen))
+                _show_toast("保存目录已更新", C["mint"], 1200)
+            except Exception as exc:
+                _show_toast(f"目录不可用: {exc}", C["danger"], 2200)
+
+    window_btn = SoftButton(window_cell, "锁定窗口", toggle_window, width=194, height=32, bg="#EAF1ED", fg="#648A7E", hover="#DEEAE4", radius=10, font_size=9)
+    window_btn.pack()
+    region_btn = SoftButton(region_cell, "框选范围", pick_region, width=194, height=32, bg="#EAF1ED", fg="#648A7E", hover="#DEEAE4", radius=10, font_size=9)
+    region_btn.pack()
+    output_btn = SoftButton(output_cell, "更改目录", choose_output, width=194, height=32, bg="#F1EFEB", fg=C["text"], hover="#E8E4DE", radius=10, font_size=9)
+    output_btn.pack()
+
+    mode_host = tk.Frame(content, bg=C["bg"])
+    mode_host.pack(fill=tk.BOTH, expand=True)
+    auto_card = card(mode_host, fill=tk.BOTH, expand=True)
+    manual_card = card(mode_host, fill=tk.BOTH, expand=True)
+
+    # Auto-only settings
+    text(auto_card, "课程计划", size=13, bold=True, fill=tk.X)
+    text(auto_card, "识别到多节课程时，将按卡片上的开始时间自动排序。", color=C["muted"], size=9, fill=tk.X, pady=(3, 16))
+    form = tk.Frame(auto_card, bg=C["card"])
+    form.pack(fill=tk.X)
+    for index in range(4):
+        form.grid_columnconfigure(index, weight=1)
+
+    def form_field(column, title, variable, helper):
+        holder = tk.Frame(form, bg=C["card"])
+        holder.grid(row=0, column=column, sticky="ew", padx=(0 if column == 0 else 8, 0), pady=(0, 14))
+        text(holder, title, color=C["muted"], size=9, bold=True, fill=tk.X, pady=(0, 6))
+        control = input_box(holder, variable)
+        control.pack(fill=tk.X, ipady=8)
+        text(holder, helper, color="#A0AABC", size=8, fill=tk.X, pady=(5, 0))
+        return control
+
+    form_field(0, "周范围", weeks_var, "1-8,10,12-16")
+    form_field(1, "单节时长", duration_var, "秒")
+    speed_holder = tk.Frame(form, bg=C["card"])
+    speed_holder.grid(row=0, column=2, sticky="ew", padx=(8, 0), pady=(0, 14))
+    text(speed_holder, "播放倍速", color=C["muted"], size=9, bold=True, fill=tk.X, pady=(0, 6))
+    ttk_style = ttk.Style(root)
+    try:
+        ttk_style.theme_use("clam")
+    except tk.TclError:
+        pass
+    ttk_style.configure("Light.TCombobox", fieldbackground=C["input"], background=C["input"], foreground=C["text"], bordercolor=C["line"], lightcolor=C["line"], darkcolor=C["line"])
+    speed_combo = ttk.Combobox(speed_holder, textvariable=speed_var, values=("auto", "1.0x", "1.25x", "1.5x", "2.0x"), state="readonly", style="Light.TCombobox")
+    speed_combo.pack(fill=tk.X, ipady=8)
+    text(speed_holder, "auto 按时长选择", color="#A0AABC", size=8, fill=tk.X, pady=(5, 0))
+    form_field(3, "末尾恢复 1×", tail_var, "提前秒数")
+
+    options = tk.Frame(auto_card, bg=C["input"], padx=14, pady=10)
+    options.pack(fill=tk.X)
+
+    def persist_options():
+        _config["simple_weeks"] = weeks_var.get().strip() or DEFAULT_SIMPLE_WEEKS
+        _config["playback_speed"] = speed_var.get()
+        _config["simple_skip_done"] = bool(skip_var.get())
+        _config["interaction_mode"] = "uia" if background_var.get() else "foreground"
+        _config["cursor_free_opt_in"] = bool(background_var.get())
+        try:
+            _config["speed_tail_seconds"] = max(0, float(tail_var.get()))
+        except ValueError:
+            _config["speed_tail_seconds"] = 90
+            tail_var.set("90")
+        _config["simple_use_card_duration"] = bool(card_duration_var.get())
+        save_config(_config)
+
+    for label_text, variable in (
+        ("跳过已经生成的课程", skip_var),
+        ("无鼠标控制（UIA）", background_var),
+        ("按卡片时长监测", card_duration_var),
+    ):
+        tk.Checkbutton(
+            options,
+            text=label_text,
+            variable=variable,
+            command=persist_options,
+            bg=C["input"],
+            fg=C["text"],
+            activebackground=C["input"],
+            activeforeground=C["text"],
+            selectcolor="#FFFFFF",
+            font=("Microsoft YaHei UI", 9),
+            bd=0,
+        ).pack(side=tk.LEFT, padx=(0, 24))
+    text(auto_card, f"{_vision_router.VERSION} 会为每张图片标记 OCR 或多模态识别路线", color=C["muted"], size=8, fill=tk.X, pady=(12, 0))
+
+    # Manual content
+    manual_intro = tk.Frame(manual_card, bg=C["card"])
+    manual_intro.pack(fill=tk.BOTH, expand=True)
+    text(manual_intro, "只检测当前课程", size=15, bold=True, fill=tk.X, pady=(6, 6))
+    manual_description = text(
+        manual_intro,
+        "打开要录制的课程后点击“开始检测”。程序只关注 PPT 翻页，不会查找、切换课程或改变播放速度。",
+        color=C["muted"],
+        size=10,
+        fill=tk.X,
+    )
+    manual_description.configure(wraplength=700)
+    tip = tk.Frame(manual_intro, bg="#EEF3F0", padx=16, pady=14)
+    tip.pack(fill=tk.X, pady=(22, 0))
+    text(tip, "画面检测在缩小的灰度图上进行，保存的课件图片仍保持原始清晰度。", color="#66877C", size=9, fill=tk.X)
+
+    # Bottom action dock
+    dock = tk.Frame(main, bg=C["card"], padx=32, pady=15, highlightbackground=C["line"], highlightthickness=1)
+    dock.pack(fill=tk.X, side=tk.BOTTOM, before=content)
+    dock_copy = tk.Frame(dock, bg=C["card"])
+    dock_copy.pack(side=tk.LEFT, fill=tk.X, expand=True)
+    action_title_var = tk.StringVar(value="自动寻找并处理课程")
+    action_detail_var = tk.StringVar(value="开始前请完成窗口锁定和范围框选")
+    text(dock_copy, variable=action_title_var, size=11, bold=True, fill=tk.X)
+    text(dock_copy, variable=action_detail_var, color=C["muted"], size=8, fill=tk.X, pady=(3, 0))
+
+    def prerequisites():
+        with _lock:
+            hwnd, region = state.get("target_hwnd"), state.get("region")
+        if not hwnd or not is_window_visible(hwnd):
+            return False, "请先锁定智慧课堂窗口"
+        if not region or region[2] < 10 or region[3] < 10:
+            return False, "请先框选 PPT 播放范围"
+        return True, ""
+
+    def start_manual():
+        ok, message = prerequisites()
+        if not ok:
+            _show_toast(message, C["danger"], 1600)
+            return
+        with _lock:
+            if state["monitoring"] or state["playing"]:
+                return
+            region = state["region"]
+        _start_monitoring(region, "手动")
+
+    def start_auto():
+        ok, message = prerequisites()
+        if not ok:
+            _show_toast(message, C["danger"], 1600)
+            return
+        weeks = _parse_week_spec(weeks_var.get())
+        if not weeks:
+            _show_toast("请检查周范围", C["danger"], 1600)
+            return
+        try:
+            duration = max(60.0, float(duration_var.get()))
+        except ValueError:
+            _show_toast("单节时长需要填写数字", C["danger"], 1600)
+            return
+        ocr_ok, ocr_message = _ocr_ready()
+        if not ocr_ok:
+            _show_toast(ocr_message, C["danger"], 2200)
+            return
+        persist_options()
+        _config["simple_duration_seconds"] = duration
+        save_config(_config)
+        log(f"[自动模式] 界面周范围 {weeks_var.get().strip()!r} -> 将按顺序处理 {weeks}")
+        threading.Thread(
+            target=run_simple_auto_courses,
+            args=(weeks, duration, skip_var.get()),
+            kwargs={"use_card_duration": bool(card_duration_var.get())},
+            daemon=True,
+        ).start()
+
+    def start_current():
+        start_auto() if mode_var.get() == "auto" else start_manual()
+
+    def stop_current():
+        stop_play()
+        _stop_monitoring()
+
+    stop_btn = SoftButton(dock, "停止", stop_current, width=112, height=46, bg=C["danger_soft"], fg=C["danger"], hover="#F2DFE0", font_size=10)
+    stop_btn.pack(side=tk.RIGHT, padx=(10, 0))
+    start_btn = SoftButton(dock, "开始自动处理", start_current, width=190, height=46, bg=C["primary"], fg="#FFFFFF", hover=C["primary_hover"], font_size=11)
+    start_btn.pack(side=tk.RIGHT)
+
+    def switch_mode(mode):
+        mode_var.set(mode)
+        _config["ui_mode"] = mode
+        save_config(_config)
+        if mode == "auto":
+            manual_card.pack_forget()
+            auto_card.pack(fill=tk.BOTH, expand=True)
+            auto_mode_btn.set_palette(C["primary"], "#FFFFFF", C["primary_hover"])
+            manual_mode_btn.set_palette("#F2F4F1", C["nav_muted"], "#E1E8E4")
+            page_title_var.set("自动处理")
+            page_subtitle_var.set("设置课程范围，程序会按时间顺序完成每一节课")
+            action_title_var.set("自动寻找并处理课程")
+            start_btn.set_text("开始自动处理")
+        else:
+            auto_card.pack_forget()
+            manual_card.pack(fill=tk.BOTH, expand=True)
+            manual_mode_btn.set_palette(C["primary"], "#FFFFFF", C["primary_hover"])
+            auto_mode_btn.set_palette("#F2F4F1", C["nav_muted"], "#E1E8E4")
+            page_title_var.set("手动检测")
+            page_subtitle_var.set("保持当前课程不变，只在 PPT 翻页时保存图片")
+            action_title_var.set("检测当前画面")
+            start_btn.set_text("开始检测")
+
+    auto_mode_btn.command = lambda: switch_mode("auto")
+    manual_mode_btn.command = lambda: switch_mode("manual")
+    switch_mode(mode_var.get() if mode_var.get() in ("auto", "manual") else "auto")
+
+    def update_ui():
+        with _lock:
+            monitoring = state["monitoring"]
+            playing = state["playing"]
+            hwnd = state.get("target_hwnd")
+            title = state.get("window_title", "")
+            region = state.get("region")
+            picking_window = state.get("window_picking")
+        locked = bool(hwnd and is_window_visible(hwnd))
+        window_value_var.set((title[:18] + "…") if locked and len(title) > 18 else (title if locked else "尚未锁定"))
+        region_value_var.set(f"{region[2]} × {region[3]}" if region else "尚未框选")
+        clean_output = OUTPUT_DIR.rstrip("\\/")
+        output_name = os.path.basename(clean_output)
+        output_parent = os.path.basename(os.path.dirname(clean_output))
+        short_output = f"{output_parent}\\{output_name}" if output_parent else (output_name or OUTPUT_DIR)
+        if len(short_output) > 24:
+            short_output = "…" + short_output[-23:]
+        output_value_var.set(short_output)
+        ready_states = (locked, bool(region), bool(OUTPUT_DIR))
+        for ready, (badge, label_widget) in zip(ready_states, step_labels):
+            badge.configure(bg=C["mint"] if ready else C["nav_soft"], fg="#FFFFFF" if ready else C["nav_muted"])
+            label_widget.configure(fg=C["nav_text"] if ready else C["nav_muted"])
+        if playing:
+            status_var.set("自动处理中")
+            action_detail_var.set("正在识别课程、切换并捕获课件")
+        elif monitoring:
+            status_var.set("正在检测")
+            action_detail_var.set("检测到翻页时会自动保存")
+        elif picking_window:
+            status_var.set("等待选择窗口")
+        else:
+            status_var.set("待机")
+            action_detail_var.set("准备完成，可以开始" if locked and region else "开始前请完成窗口锁定和范围框选")
+        window_btn.set_text("解除锁定" if locked else "锁定窗口")
+        region_btn.set_text("重新框选" if region else "框选范围")
+        root.after(400, update_ui)
+
+    def on_close():
+        with _lock:
+            state["running"] = False
+            state["monitoring"] = False
+            state["playing"] = False
+            state["playing_all"] = False
+        _graphics_capture.stop()
+        root.destroy()
+
+    root.protocol("WM_DELETE_WINDOW", on_close)
+    update_ui()
     return root
 
 # ====================== 主入口 ======================
@@ -3182,9 +5623,9 @@ def main():
     log(f"已加载 {len(state['groups'])} 个组 | 默认延迟 {d:.1f}s | 全局循环={lp} | 定时间隔 {mins} 分钟")
     for i, g in enumerate(state["groups"]):
         log(f"  [{i+1}] {g['name']}: {len(g.get('clicks', []))}步 循环{g.get('repeat', 1)}次 时长{_get_group_duration(g):.0f}s")
-    log("Alt+Q=选区域 | Alt+W=监测 | Alt+E=截图 | Alt+R=录制 | Alt+T=执行当前组 | Alt+U=执行全部组 | Alt+Y=停止 | Alt+I=锁定窗口 | Alt+O=退出")
+    log("Alt+I=锁定窗口 | Alt+Q=选区域 | Alt+W=手动监测 | Alt+E=保存当前页 | Alt+Y=停止 | Alt+O=退出")
 
-    root = create_gui()
+    root = create_gui_v9()
     root.mainloop()
 
 if __name__ == "__main__":

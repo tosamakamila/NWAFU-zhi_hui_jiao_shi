@@ -9,4 +9,6 @@ dependencies = [
     "pyautogui>=0.9.54",
     "pynput>=1.7.6",
     "pytesseract>=0.3.10",
+    "uiautomation==2.0.29",
+    "windows-capture==2.0.1",
 ]
