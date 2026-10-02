@@ -68,7 +68,8 @@ def _candidate_project_files(filename):
     """Search project-owned tool/data folders without traversing captures or environments."""
     skip_dirs = {
         ".git", ".venv", "venv", ".uv-cache", "__pycache__", "ppt_slides",
-        ".codex", ".claude", "tests", "node_modules",
+        ".mamba", ".python-runtime", ".setup-cache", ".codex", ".claude",
+        "tests", "node_modules",
     }
     for root in (APP_DIR, os.path.join(APP_DIR, "tools"), os.path.join(APP_DIR, "vendor")):
         if not os.path.isdir(root):
@@ -85,8 +86,6 @@ def _find_tesseract():
     if configured:
         candidates.append(configured)
     on_path = shutil.which("tesseract") or shutil.which("tesseract.exe")
-    if on_path:
-        candidates.append(on_path)
 
     for base in (
         APP_DIR,
@@ -102,6 +101,8 @@ def _find_tesseract():
                 os.path.join(base, "Tesseract-OCR", "tesseract.exe"),
             ))
     candidates.extend(_candidate_project_files("tesseract.exe"))
+    if on_path:
+        candidates.append(on_path)
     for candidate in dict.fromkeys(candidates):
         if os.path.isfile(candidate):
             return os.path.abspath(candidate)
